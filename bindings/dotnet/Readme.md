@@ -220,6 +220,13 @@ using var connection = new TursoConnection("Data Source=app.db") { PageCodec = c
 connection.Open();
 ```
 
+The `Turso.Data.Sqlite` facade takes the codec the same way, and EF Core takes the pre-configured connection:
+
+```C#
+using var connection = new SqliteConnection("Data Source=app.db") { PageCodec = codec };
+options.UseTurso(connection);
+```
+
 The raw API is `TursoBindings.OpenDatabaseWithPageCodec`, `OpenDatabaseReadOnlyWithPageCodec` (read-only) and
 `OpenSharedDatabase(path, codec)`.
 
@@ -227,11 +234,12 @@ The raw API is `TursoBindings.OpenDatabaseWithPageCodec`, `OpenDatabaseReadOnlyW
   `ReservedSpace` bytes; opening an existing database fails unless its header holds the same value.
 - `CodecId` must be non-zero and must change whenever encoded bytes could differ, such as with another key. A
   process keeps one database per path and refuses a connection whose codec ID differs from the one the database was
-  opened with, instead of reading through the wrong codec.
+  opened with, instead of reading through the wrong codec. Pooled facade databases are keyed by path and `CodecId`
+  for the same reason.
 - Callbacks run concurrently on any thread that steps a statement, so the codec must be thread-safe and must not call
   back into Turso. An exception thrown by the codec fails the page operation with a generic message.
 - The codec does not cover temporary files: run `PRAGMA temp_store = memory` on each connection. It cannot be combined
-  with `Encryption Cipher`, `ATTACH`, MVCC, remote URLs or embedded replicas.
+  with `Encryption Cipher`, the facade's `Password`, `ATTACH`, MVCC, remote URLs or embedded replicas.
 
 ## Migrating from Microsoft.Data.Sqlite
 
