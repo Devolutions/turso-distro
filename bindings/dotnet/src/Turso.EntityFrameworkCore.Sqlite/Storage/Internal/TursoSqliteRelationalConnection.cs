@@ -48,9 +48,20 @@ public class TursoSqliteRelationalConnection : SqliteRelationalConnection
             Pooling = false
         };
 
-        var contextOptions = new DbContextOptionsBuilder()
-            .UseTurso(connectionStringBuilder.ToString())
-            .Options;
+        // A page codec cannot travel in the connection string, so hand it to the probe connection.
+        var optionsBuilder = new DbContextOptionsBuilder();
+        if ((DbConnection as TursoSqliteConnection)?.PageCodec is { } pageCodec)
+        {
+            optionsBuilder.UseTurso(
+                new TursoSqliteConnection(connectionStringBuilder.ToString()) { PageCodec = pageCodec },
+                contextOwnsConnection: true);
+        }
+        else
+        {
+            optionsBuilder.UseTurso(connectionStringBuilder.ToString());
+        }
+
+        var contextOptions = optionsBuilder.Options;
 
         return new TursoSqliteRelationalConnection(
             Dependencies with { ContextOptions = contextOptions },

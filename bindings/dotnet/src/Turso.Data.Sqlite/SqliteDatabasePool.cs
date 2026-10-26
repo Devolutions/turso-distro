@@ -14,17 +14,20 @@ namespace Turso.Data.Sqlite;
 /// reused, so this pools databases rather than connections. Each entry also holds one idle anchor
 /// connection: closing the last connection to a database checkpoints the whole WAL, and the anchor
 /// keeps that from happening on every <see cref="SqliteConnection.Close"/>.
+/// Entries are keyed by file and page codec ID, so a connection never joins a database opened with
+/// another codec configuration (for example another key).
 /// </remarks>
 internal static class SqliteDatabasePool
 {
+    private static readonly StringComparer PathComparer =
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
     private static readonly object Gate = new();
-    private static readonly Dictionary<string, Entry> Entries = new(
-        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+    private static readonly Dictionary<Key, Entry> Entries = new(new KeyComparer());
     private static bool _processExitHooked;
 
-    public static TursoDatabaseHandle Connect(string filename)
+    public static TursoDatabaseHandle Connect(string filename, ITursoPageCodec? pageCodec)
     {
-        var key = Path.GetFullPath(filename);
+        var key = new Key(Path.GetFullPath(filename), pageCodec?.CodecId);
         while (true)
         {
             Entry? entry;
@@ -55,7 +58,9 @@ internal static class SqliteDatabasePool
                     TursoSharedDatabaseHandle? database = null;
                     try
                     {
-                        database = TursoBindings.OpenSharedDatabase(filename);
+                        database = pageCodec is null
+                            ? TursoBindings.OpenSharedDatabase(filename)
+                            : TursoBindings.OpenSharedDatabase(filename, pageCodec);
                         entry.Anchor = TursoBindings.Connect(database);
                     }
                     catch
@@ -77,7 +82,7 @@ internal static class SqliteDatabasePool
     // while waiting for an entry lock. Marking the entry cleared sends connections waiting on
     // it back to the dictionary, so none of them opens a database on an entry that is no
     // longer reachable from ClearPool.
-    private static void RemoveFailedEntry(string key, Entry entry)
+    private static void RemoveFailedEntry(Key key, Entry entry)
     {
         entry.Cleared = true;
         lock (Gate)
@@ -87,17 +92,22 @@ internal static class SqliteDatabasePool
         }
     }
 
+    // Clears the entries for every codec configuration of the file.
     public static void Clear(string filename)
     {
-        var key = Path.GetFullPath(filename);
-        Entry? entry;
+        var path = Path.GetFullPath(filename);
+        List<Entry> entries = [];
         lock (Gate)
         {
-            if (!Entries.Remove(key, out entry))
-                return;
+            foreach (var key in Entries.Keys.Where(key => PathComparer.Equals(key.Path, path)).ToList())
+            {
+                Entries.Remove(key, out var entry);
+                entries.Add(entry!);
+            }
         }
 
-        entry.Release();
+        foreach (var entry in entries)
+            entry.Release();
     }
 
     public static void ClearAll()
@@ -111,6 +121,15 @@ internal static class SqliteDatabasePool
 
         foreach (var entry in entries)
             entry.Release();
+    }
+
+    private readonly record struct Key(string Path, TursoPageCodecId? CodecId);
+
+    private sealed class KeyComparer : IEqualityComparer<Key>
+    {
+        public bool Equals(Key x, Key y) => PathComparer.Equals(x.Path, y.Path) && x.CodecId == y.CodecId;
+
+        public int GetHashCode(Key key) => HashCode.Combine(PathComparer.GetHashCode(key.Path), key.CodecId);
     }
 
     private sealed class Entry

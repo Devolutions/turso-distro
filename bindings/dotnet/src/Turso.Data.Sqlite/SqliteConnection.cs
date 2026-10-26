@@ -30,6 +30,7 @@ public partial class SqliteConnection : DbConnection
     private bool _readUncommitted;
     private string? _sharedMemoryPath;
     private bool _extensionsEnabled;
+    private ITursoPageCodec? _pageCodec;
     private readonly List<(string File, string? Proc)> _pendingExtensions = [];
 
     public SqliteConnection()
@@ -84,6 +85,25 @@ public partial class SqliteConnection : DbConnection
     public override string Database => _managedConnection?.Database ?? "main";
 
     public override string DataSource => _managedConnection?.DataSource ?? _dataSource ?? _connectionOptions.DataSource;
+
+    /// <summary>
+    ///     A codec that transforms every page of a local database on its way to and from storage, for
+    ///     example to encrypt it. Set it before <see cref="Open" />, since a connection string cannot
+    ///     carry it. Pooled databases are keyed by file and <see cref="ITursoPageCodec.CodecId" />, so
+    ///     connections with different codec IDs never share one. Not supported for remote or replica
+    ///     connections.
+    /// </summary>
+    public ITursoPageCodec? PageCodec
+    {
+        get => _pageCodec;
+        set
+        {
+            if (State == ConnectionState.Open)
+                throw new InvalidOperationException("PageCodec cannot be set while the connection is open.");
+
+            _pageCodec = value;
+        }
+    }
 
     public int DefaultTimeout
     {
@@ -145,6 +165,7 @@ public partial class SqliteConnection : DbConnection
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_managedConnection is not null)
         {
+            ThrowIfPageCodecIsSet();
             var managedOriginalState = State;
             try
             {
@@ -171,8 +192,10 @@ public partial class SqliteConnection : DbConnection
         try
         {
             _database = CanPool(_connectionOptions, filename, sharedMemoryPath)
-                ? SqliteDatabasePool.Connect(filename)
-                : TursoBindings.OpenDatabase(filename);
+                ? SqliteDatabasePool.Connect(filename, _pageCodec)
+                : _pageCodec is null
+                    ? TursoBindings.OpenDatabase(filename)
+                    : TursoBindings.OpenDatabaseWithPageCodec(filename, _pageCodec);
             _dataSource = filename;
             _readOnly = readOnly;
             _sharedMemoryPath = sharedMemoryPath;
@@ -834,6 +857,7 @@ public partial class SqliteConnection : DbConnection
     private async Task OpenManagedAsync(CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        ThrowIfPageCodecIsSet();
         var originalState = State;
         try
         {
@@ -859,6 +883,15 @@ public partial class SqliteConnection : DbConnection
         var currentState = State;
         if (currentState != originalState)
             OnStateChange(new StateChangeEventArgs(originalState, currentState));
+    }
+
+    private void ThrowIfPageCodecIsSet()
+    {
+        if (_pageCodec is not null)
+        {
+            throw new InvalidOperationException(
+                "PageCodec is a local database option and cannot be used with remote or embedded replica connections.");
+        }
     }
 
     private void ThrowIfManagedLocalOnly(string operation)
