@@ -547,6 +547,19 @@ jobs:
         working-directory: ${{ env.TURSO_DOTNET_DIR }}
 
     steps:
+      # The native artifacts are ~2 GB compressed (static libraries for every
+      # RID), and make pack copies them again into the NativeAot packages,
+      # which exhausts the default runner disk. Remove preinstalled toolchains
+      # this job never uses; /usr/share/dotnet stays for setup-dotnet.
+      - name: Free runner disk space
+        working-directory: .
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/swift \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/chromium
+          sudo docker image prune --all --force > /dev/null
+          df -h /
+
       - name: Clone project with Turso submodule
         uses: actions/checkout@v7.0.0
         with:
