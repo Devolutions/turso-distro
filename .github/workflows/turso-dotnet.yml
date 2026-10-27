@@ -1,0 +1,1021 @@
+name: Turso .NET
+on:
+  workflow_dispatch:
+    inputs:
+      package_revision:
+        description: Downstream package revision override (blank = use PACKAGE_REVISION, auto = infer next release revision)
+        default: ""
+        required: false
+      github-env:
+        description: GitHub environment selection
+        required: true
+        type: choice
+        options:
+          - auto
+          - test
+          - prod
+        default: auto
+      skip-publish:
+        description: Skip downstream publishing when called by turso-release.yml
+        required: true
+        type: boolean
+        default: false
+      dry-run:
+        description: Dry run (simulate publishing)
+        required: true
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      package_revision:
+        description: Downstream package revision override (blank = use PACKAGE_REVISION, auto = infer next release revision)
+        default: ""
+        required: false
+        type: string
+      github-env:
+        description: GitHub environment selection
+        required: false
+        type: string
+        default: auto
+      skip-publish:
+        description: Skip downstream publishing in the caller
+        required: false
+        type: boolean
+        default: false
+      dry-run:
+        description: Dry run (simulate publishing)
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      package-env:
+        description: Selected GitHub publishing environment
+        value: ${{ jobs.preflight.outputs.package-env }}
+      turso-version:
+        description: Turso upstream version
+        value: ${{ jobs.preflight.outputs.turso-version }}
+      turso-release-tag:
+        description: Turso upstream release tag
+        value: ${{ jobs.preflight.outputs.turso-release-tag }}
+      turso-upstream-tag:
+        description: Mirrored upstream Turso source ref
+        value: ${{ jobs.preflight.outputs.turso-upstream-tag }}
+      turso-source-ref:
+        description: Downstream Turso source ref
+        value: ${{ jobs.preflight.outputs.turso-source-ref }}
+      turso-source-commit:
+        description: Pinned Turso source commit
+        value: ${{ jobs.preflight.outputs.turso-source-commit }}
+      package-version:
+        description: Vendored package version
+        value: ${{ jobs.preflight.outputs.package-version }}
+      release-package-artifact:
+        description: Release-ready vendored package artifact name
+        value: ${{ jobs.preflight.outputs.release-package-artifact }}
+      release-tag:
+        description: GitHub release tag
+        value: ${{ jobs.preflight.outputs.release-tag }}
+      release-title:
+        description: GitHub release title
+        value: ${{ jobs.preflight.outputs.release-title }}
+      skip-publish:
+        description: Whether downstream publishing should be skipped
+        value: ${{ jobs.preflight.outputs.skip-publish }}
+      dry-run:
+        description: Effective dry-run value
+        value: ${{ jobs.preflight.outputs.dry-run }}
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  TURSO_VERSION: "0.9.0-pre.1"
+  TURSO_RELEASE_TAG: "v0.9.0-pre.1"
+  TURSO_UPSTREAM_TAG: "upstream/v0.9.0-pre.1"
+  TURSO_SOURCE_REPOSITORY: ${{ github.repository }}
+  TURSO_SOURCE_REF: "downstream/v0.9.0-pre.1"
+  TURSO_DOTNET_DIR: "turso-src/bindings/dotnet"
+  PACKAGE_VENDOR_NAME: "Devolutions"
+  PACKAGE_ID_PREFIX: "Devolutions.Turso."
+  PACKAGE_REVISION: "0"
+  # Windows images ship VS Build Tools without LLVM, so the aegis crate's
+  # clang-cl preference fails; force the MSVC compiler instead.
+  CC_x86_64_pc_windows_msvc: cl.exe
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-24.04
+    outputs:
+      package-env: ${{ steps.info.outputs.package-env }}
+      turso-version: ${{ steps.info.outputs.turso-version }}
+      turso-release-tag: ${{ steps.info.outputs.turso-release-tag }}
+      turso-upstream-tag: ${{ steps.info.outputs.turso-upstream-tag }}
+      turso-source-ref: ${{ steps.info.outputs.turso-source-ref }}
+      turso-source-commit: ${{ steps.info.outputs.turso-source-commit }}
+      package-revision: ${{ steps.info.outputs.package-revision }}
+      package-version: ${{ steps.info.outputs.package-version }}
+      release-package-artifact: ${{ steps.info.outputs.release-package-artifact }}
+      release-tag: ${{ steps.info.outputs.release-tag }}
+      release-title: ${{ steps.info.outputs.release-title }}
+      skip-publish: ${{ steps.info.outputs.skip-publish }}
+      dry-run: ${{ steps.info.outputs.dry-run }}
+
+    steps:
+      - name: Clone project
+        uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Package information
+        id: info
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $ExpectedVersion = $Env:TURSO_RELEASE_TAG -replace '^v', ''
+          if ($Env:TURSO_VERSION -ne $ExpectedVersion) {
+            throw "TURSO_VERSION '$Env:TURSO_VERSION' does not match TURSO_RELEASE_TAG '$Env:TURSO_RELEASE_TAG'."
+          }
+          if ($Env:TURSO_UPSTREAM_TAG -ne "upstream/$Env:TURSO_RELEASE_TAG") {
+            throw "TURSO_UPSTREAM_TAG '$Env:TURSO_UPSTREAM_TAG' does not match TURSO_RELEASE_TAG '$Env:TURSO_RELEASE_TAG'."
+          }
+
+          $SourceTreeEntry = & git ls-tree HEAD turso-src
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($SourceTreeEntry)) {
+            throw "Unable to read the turso-src submodule pointer from HEAD."
+          }
+          if ($SourceTreeEntry -notmatch '^\d+\s+commit\s+([0-9a-f]{40})\s+turso-src$') {
+            throw "Unexpected turso-src tree entry: $SourceTreeEntry"
+          }
+          $TursoSourceCommit = $Matches[1]
+
+          $SubmoduleBranch = (& git config -f .gitmodules --get submodule.turso-src.branch).Trim()
+          if ($SubmoduleBranch -ne $Env:TURSO_SOURCE_REF) {
+            throw ".gitmodules tracks '$SubmoduleBranch' but TURSO_SOURCE_REF is '$Env:TURSO_SOURCE_REF'."
+          }
+
+          & git fetch --no-tags origin "+refs/heads/$($Env:TURSO_SOURCE_REF):refs/remotes/origin/$($Env:TURSO_SOURCE_REF)" "+refs/tags/$($Env:TURSO_UPSTREAM_TAG):refs/tags/$($Env:TURSO_UPSTREAM_TAG)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to fetch $Env:TURSO_SOURCE_REF and $Env:TURSO_UPSTREAM_TAG."
+          }
+          & git merge-base --is-ancestor $TursoSourceCommit "refs/remotes/origin/$($Env:TURSO_SOURCE_REF)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned turso-src commit $TursoSourceCommit is not on $Env:TURSO_SOURCE_REF."
+          }
+          & git merge-base --is-ancestor "refs/tags/$($Env:TURSO_UPSTREAM_TAG)" $TursoSourceCommit
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned turso-src commit $TursoSourceCommit is not based on $Env:TURSO_UPSTREAM_TAG."
+          }
+
+          try { $SkipPublish = [System.Boolean]::Parse('${{ inputs.skip-publish }}') }
+          catch { $SkipPublish = $false }
+          try { $DryRun = [System.Boolean]::Parse('${{ inputs.dry-run }}') }
+          catch { $DryRun = $true }
+
+          $IsMasterBranch = ('${{ github.ref_name }}' -eq 'master')
+          $IsScheduledJob = ('${{ github.event_name }}' -eq 'schedule')
+          $RequestedDryRun = $DryRun
+
+          $RequestedEnvironment = '${{ inputs.github-env }}'.Trim().ToLowerInvariant()
+          if ([string]::IsNullOrWhiteSpace($RequestedEnvironment)) {
+            $RequestedEnvironment = 'auto'
+          }
+
+          switch ($RequestedEnvironment) {
+            'auto' {
+              $PackageEnv = if ($IsMasterBranch -and -not $IsScheduledJob) {
+                'publish-prod'
+              } else {
+                'publish-test'
+              }
+            }
+            'test' {
+              $PackageEnv = 'publish-test'
+            }
+            'prod' {
+              $PackageEnv = 'publish-prod'
+            }
+            default {
+              throw "Unsupported github-env value: $RequestedEnvironment (expected auto, test, or prod)"
+            }
+          }
+
+          if ($RequestedEnvironment -eq 'test' -and ($IsMasterBranch -or (-not $SkipPublish -and -not $RequestedDryRun))) {
+            $PackageEnv = 'publish-prod'
+            echo '::notice::github-env=test was promoted to publish-prod'
+          }
+
+          if (-not $IsMasterBranch -and $PackageEnv -ne 'publish-prod') {
+            $DryRun = $true
+          }
+
+          if ($IsScheduledJob) {
+            $DryRun = $true
+          }
+
+          if (-not $SkipPublish -and $PackageEnv -ne 'publish-prod') {
+            $DryRun = $true
+          }
+
+          git fetch --tags --force | Out-Null
+
+          $RevisionInput = '${{ inputs.package_revision }}'.Trim()
+          if ([string]::IsNullOrWhiteSpace($RevisionInput)) {
+            $RevisionInput = $Env:PACKAGE_REVISION
+          }
+
+          if ($RevisionInput.Trim().ToLowerInvariant() -eq 'auto') {
+            $TagPrefix = "v$Env:TURSO_VERSION."
+            $MatchingTags = @(git tag -l "$TagPrefix*" | Sort-Object)
+
+            $Revisions = @()
+            foreach ($Tag in $MatchingTags) {
+              if ($Tag -match "^v$([regex]::Escape($Env:TURSO_VERSION))\.(\d+)$") {
+                $Revisions += [int]$Matches[1]
+              }
+            }
+
+            if ($Revisions.Count -eq 0) {
+              $PackageRevision = 0
+            } else {
+              $PackageRevision = ($Revisions | Measure-Object -Maximum).Maximum + 1
+            }
+
+            $TagsDisplay = if ($MatchingTags.Count -gt 0) { $MatchingTags -join ', ' } else { '(none)' }
+            echo "::notice::MatchingTags: $TagsDisplay"
+            echo "::notice::NextRevision: $PackageRevision"
+          } else {
+            if ($RevisionInput -notmatch '^\d+$') {
+              throw "Package revision '$RevisionInput' must be numeric or 'auto'."
+            }
+
+            $PackageRevision = [int]$RevisionInput
+          }
+
+          # Downstream package version = upstream Turso version + ".R", for
+          # example 0.9.0-pre.1.0 or 0.8.3.2. Prerelease upstream versions keep
+          # the revision in the prerelease label so ordering follows upstream.
+          $PackageVersion = "$Env:TURSO_VERSION.$PackageRevision"
+          $ReleaseTag = "v$PackageVersion"
+          $ReleaseTitle = "Devolutions.Turso $ReleaseTag"
+
+          $Outputs = [ordered]@{
+            'package-env' = $PackageEnv
+            'turso-version' = $Env:TURSO_VERSION
+            'turso-release-tag' = $Env:TURSO_RELEASE_TAG
+            'turso-upstream-tag' = $Env:TURSO_UPSTREAM_TAG
+            'turso-source-ref' = $Env:TURSO_SOURCE_REF
+            'turso-source-commit' = $TursoSourceCommit
+            'package-revision' = $PackageRevision
+            'package-version' = $PackageVersion
+            'release-package-artifact' = "Devolutions-Turso-NuGet-$PackageVersion"
+            'release-tag' = $ReleaseTag
+            'release-title' = $ReleaseTitle
+            'skip-publish' = $SkipPublish.ToString().ToLowerInvariant()
+            'dry-run' = $DryRun.ToString().ToLowerInvariant()
+          }
+
+          foreach ($Key in $Outputs.Keys) {
+            echo "$Key=$($Outputs[$Key])" >> $Env:GITHUB_OUTPUT
+            echo "::notice::$Key=$($Outputs[$Key])"
+          }
+
+  build-natives:
+    name: Native ${{ matrix.artifact-name }}
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            make-target: build-rust-linux64
+            artifact-name: native-linux-x64
+            target: x86_64-unknown-linux-gnu
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
+
+          - os: ubuntu-24.04
+            make-target: build-rust-linuxarm64
+            artifact-name: native-linux-arm64
+            target: aarch64-unknown-linux-gnu
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
+
+          - os: ubuntu-24.04
+            make-target: build-rust-androidarm64
+            artifact-name: native-android-arm64
+            target: aarch64-linux-android
+
+          - os: ubuntu-24.04
+            make-target: build-rust-androidarm
+            artifact-name: native-android-arm
+            target: armv7-linux-androideabi
+
+          - os: ubuntu-24.04
+            make-target: build-rust-androidx64
+            artifact-name: native-android-x64
+            target: x86_64-linux-android
+
+          - os: ubuntu-24.04
+            make-target: build-rust-androidx86
+            artifact-name: native-android-x86
+            target: i686-linux-android
+
+          - os: macos-26-intel
+            make-target: build-rust-macos64
+            artifact-name: native-osx-x64
+            target: x86_64-apple-darwin
+            macos-deployment-target: "10.13"
+
+          - os: macos-26
+            make-target: build-rust-macosarm64
+            artifact-name: native-osx-arm64
+            target: aarch64-apple-darwin
+            macos-deployment-target: "11.0"
+
+          - os: macos-26
+            make-target: build-rust-iosarm64
+            artifact-name: native-ios-arm64
+            target: aarch64-apple-ios
+            ios-deployment-target: "12.2"
+
+          - os: macos-26
+            make-target: build-rust-iossimulatorarm64
+            artifact-name: native-iossimulator-arm64
+            target: aarch64-apple-ios-sim
+            ios-deployment-target: "12.2"
+
+          - os: windows-2025
+            make-target: build-rust-windows64
+            artifact-name: native-win-x64
+            target: x86_64-pc-windows-msvc
+
+          - os: windows-2025
+            make-target: build-rust-windowsarm64
+            artifact-name: native-win-arm64
+            target: aarch64-pc-windows-msvc
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: ${{ env.TURSO_DOTNET_DIR }}
+
+    steps:
+      - name: Enable git long paths
+        if: runner.os == 'Windows'
+        working-directory: .
+        run: git config --global core.longpaths true
+
+      - name: Clone project with Turso submodule
+        uses: actions/checkout@v7.0.0
+        with:
+          submodules: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # turso-src/rust-toolchain.toml pins the toolchain; add the target to it.
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Setup MSVC
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ./turso-src/.github/shared/setup-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-turso-distro-dotnet"
+          key: ${{ matrix.target }}
+          workspaces: "turso-src -> bindings/dotnet/rs_compiled"
+          cache-on-failure: true
+
+      - name: Set up Android SDK
+        if: contains(matrix.target, 'linux-android')
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+
+      - name: Install Android NDK
+        if: contains(matrix.target, 'linux-android')
+        shell: bash
+        run: |
+          sdkmanager --install "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install cargo-ndk
+        if: contains(matrix.target, 'linux-android')
+        run: cargo install cargo-ndk --locked
+
+      - name: Build rust native library (Linux in Docker)
+        if: contains(matrix.target, 'unknown-linux-gnu')
+        shell: bash
+        working-directory: .
+        run: |
+          mkdir -p $HOME/.cargo/git/db $HOME/.cargo/registry/cache $HOME/.cargo/registry/index
+          docker run --rm --user 0:0 \
+            -v $HOME/.cargo/git/db:/usr/local/cargo/git/db \
+            -v $HOME/.cargo/registry/cache:/usr/local/cargo/registry/cache \
+            -v $HOME/.cargo/registry/index:/usr/local/cargo/registry/index \
+            -v ${{ github.workspace }}:/build \
+            -w /build/${{ env.TURSO_DOTNET_DIR }} \
+            ${{ matrix.docker }} \
+            bash -lc '
+              rustup target add ${{ matrix.target }}
+              if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+                apt-get update
+                apt-get install -y gcc-aarch64-linux-gnu
+                unset CFLAGS CXXFLAGS TARGET_CFLAGS TARGET_CXXFLAGS CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH
+                export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+                export CFLAGS="-DSIMSIMD_TARGET_SIERRA=0 -DSIMSIMD_TARGET_TURIN=0 -DSIMSIMD_TARGET_SAPPHIRE=0 -DSIMSIMD_TARGET_GENOA=0 -DSIMSIMD_TARGET_ICE=0 -DSIMSIMD_TARGET_SKYLAKE=0 -DSIMSIMD_TARGET_HASWELL=0"
+                export CFLAGS_aarch64_unknown_linux_gnu="$CFLAGS"
+              fi
+              make ${{ matrix.make-target }} RUST_RELEASE_OPT="--profile release-official" RUST_PROFILE_DIR="release-official"
+            '
+
+      - name: Build rust native library (macOS)
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos-deployment-target }}
+        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official' RUST_PROFILE_DIR='release-official'
+
+      - name: Build rust native library (iOS)
+        if: contains(matrix.target, 'apple-ios')
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: ${{ matrix.ios-deployment-target }}
+        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official' RUST_PROFILE_DIR='release-official'
+
+      - name: Build rust native library
+        if: ${{ !contains(matrix.target, 'unknown-linux-gnu') && !contains(matrix.target, 'apple-darwin') && !contains(matrix.target, 'apple-ios') }}
+        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official' RUST_PROFILE_DIR='release-official'
+
+      - name: Collect Windows static native dependencies
+        if: contains(matrix.target, 'pc-windows-msvc')
+        shell: pwsh
+        run: |
+          $target = '${{ matrix.target }}'
+          $arch = if ($target -eq 'x86_64-pc-windows-msvc') { 'x86_64' } else { 'aarch64' }
+          $crate = "windows_${arch}_msvc"
+          $destination = "rs_compiled\$target\release-official\native-static-libs"
+          New-Item -ItemType Directory -Force $destination | Out-Null
+
+          $versions = @()
+          $currentPackage = $null
+          foreach ($line in Get-Content "..\..\Cargo.lock") {
+            if ($line -match '^name = "([^"]+)"') {
+              $currentPackage = $Matches[1]
+            } elseif ($currentPackage -eq $crate -and $line -match '^version = "([^"]+)"') {
+              $versions += $Matches[1]
+              $currentPackage = $null
+            }
+          }
+          if (-not $versions) {
+            throw "No $crate package entries were found in Cargo.lock"
+          }
+
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+          $registrySrc = Join-Path $cargoHome "registry\src"
+          foreach ($version in ($versions | Sort-Object -Unique)) {
+            Get-ChildItem -Path $registrySrc -Recurse -Directory -Filter "$crate-$version" |
+              ForEach-Object {
+                Copy-Item -Path (Join-Path $_.FullName "lib\windows*.lib") -Destination $destination -Force
+              }
+          }
+
+          $collected = Get-ChildItem -Path $destination -Filter "windows*.lib"
+          if (-not $collected) {
+            throw "No windows*.lib static dependencies were collected for $target"
+          }
+          $now = [DateTime]::UtcNow
+          foreach ($library in $collected) {
+            $library.LastWriteTimeUtc = $now
+          }
+
+      - name: Upload rust native library
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: |
+            ${{ env.TURSO_DOTNET_DIR }}/rs_compiled/**/turso_sdk_kit.dll
+            ${{ env.TURSO_DOTNET_DIR }}/rs_compiled/**/turso_sdk_kit.lib
+            ${{ env.TURSO_DOTNET_DIR }}/rs_compiled/**/windows*.lib
+            ${{ env.TURSO_DOTNET_DIR }}/rs_compiled/**/libturso_sdk_kit.so
+            ${{ env.TURSO_DOTNET_DIR }}/rs_compiled/**/libturso_sdk_kit.dylib
+            ${{ env.TURSO_DOTNET_DIR }}/rs_compiled/**/libturso_sdk_kit.a
+          if-no-files-found: error
+          retention-days: 1
+
+  package-ios-framework:
+    name: Package iOS XCFramework
+    needs: build-natives
+    runs-on: macos-26
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ env.TURSO_DOTNET_DIR }}
+
+    steps:
+      - name: Clone project with Turso submodule
+        uses: actions/checkout@v7.0.0
+        with:
+          submodules: true
+
+      - name: Download iOS native libraries
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: native-ios*
+          path: ${{ env.TURSO_DOTNET_DIR }}/rs_compiled
+          merge-multiple: true
+
+      - name: Package iOS XCFramework
+        run: make package-rust-iosframework RUST_PROFILE_DIR=release-official
+
+      - name: Upload iOS XCFramework
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: native-ios-universal
+          path: ${{ env.TURSO_DOTNET_DIR }}/rs_compiled/**/libturso_sdk_kit.xcframework/**
+          if-no-files-found: error
+          retention-days: 1
+
+  pack:
+    name: Pack and vendor NuGet packages
+    needs: [preflight, build-natives, package-ios-framework]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ env.TURSO_DOTNET_DIR }}
+
+    steps:
+      - name: Clone project with Turso submodule
+        uses: actions/checkout@v7.0.0
+        with:
+          submodules: true
+
+      - name: Install .NET SDKs
+        uses: actions/setup-dotnet@v5.3.0
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Verify Turso source version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [xml] $BuildProps = Get-Content -LiteralPath Directory.Build.props
+          $SourceVersion = @($BuildProps.Project.PropertyGroup | ForEach-Object { $_.Version } | Where-Object { $_ }) | Select-Object -First 1
+          if ($SourceVersion -ne $Env:TURSO_VERSION) {
+            throw "turso-src bindings/dotnet Version '$SourceVersion' does not match TURSO_VERSION '$Env:TURSO_VERSION'."
+          }
+
+      - name: Download all native libraries
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: native-*
+          path: ${{ env.TURSO_DOTNET_DIR }}/rs_compiled
+          merge-multiple: true
+
+      - name: Build and pack upstream packages
+        run: make pack
+
+      - name: Verify upstream NuGet native assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          native_package=$(find src/Turso.Raw/bin/Release -maxdepth 1 -name 'Turso.Data.Native.*.nupkg' | head -n 1)
+          if [ -z "$native_package" ]; then
+            echo "No Turso.Data.Native NuGet package found"
+            exit 1
+          fi
+
+          unzip -Z1 "$native_package" > native-package-files.txt
+          native_required_files=(
+            "buildTransitive/Turso.Data.Native.targets"
+            "runtimes/win-x64/native/turso_sdk_kit.dll"
+            "runtimes/win-arm64/native/turso_sdk_kit.dll"
+            "runtimes/linux-x64/native/libturso_sdk_kit.so"
+            "runtimes/linux-arm64/native/libturso_sdk_kit.so"
+            "runtimes/osx-x64/native/libturso_sdk_kit.dylib"
+            "runtimes/osx-arm64/native/libturso_sdk_kit.dylib"
+            "runtimes/android-arm64/native/libturso_sdk_kit.so"
+            "runtimes/android-arm/native/libturso_sdk_kit.so"
+            "runtimes/android-x64/native/libturso_sdk_kit.so"
+            "runtimes/android-x86/native/libturso_sdk_kit.so"
+            "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/Info.plist"
+            "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64/libturso_sdk_kit.framework/libturso_sdk_kit"
+            "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64-simulator/libturso_sdk_kit.framework/libturso_sdk_kit"
+          )
+          for required_file in "${native_required_files[@]}"; do
+            if ! grep -Fxq "$required_file" native-package-files.txt; then
+              echo "Missing $required_file in $native_package"
+              exit 1
+            fi
+          done
+
+          for rid in win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64; do
+            static_package=$(find src/Turso.Data.Sqlite.NativeAot/bin/Release -maxdepth 1 -name "Turso.Data.NativeAot.${rid}.*.nupkg" | head -n 1)
+            if [ -z "$static_package" ]; then
+              echo "No Turso.Data.NativeAot.${rid} NuGet package found"
+              exit 1
+            fi
+          done
+
+          while IFS= read -r package; do
+            if unzip -Z1 "$package" | grep -Fq "turso_sync_sdk_kit"; then
+              echo "Internal Rust crate name leaked into $package"
+              exit 1
+            fi
+          done < <(find src -path '*/bin/Release/*.nupkg' -type f)
+
+          android_native=$(mktemp)
+          unzip -p "$native_package" runtimes/android-arm64/native/libturso_sdk_kit.so > "$android_native"
+          python3 scripts/check_elf_dynsym_exports.py "$android_native" \
+            turso_sync_database_new \
+            turso_sync_database_create \
+            turso_sync_database_open \
+            turso_sync_database_connect \
+            turso_sync_database_stats \
+            turso_sync_database_checkpoint \
+            turso_sync_database_deinit
+          rm "$android_native"
+
+      - name: Collect upstream NuGet packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          upstream_dir="$GITHUB_WORKSPACE/output/upstream-packages"
+          rm -rf "$upstream_dir"
+          mkdir -p "$upstream_dir"
+          files=(
+            src/Turso.Raw/bin/Release/Turso.Data.Native.*.nupkg
+            src/Turso.Data/bin/Release/Turso.Data.Common.*.nupkg
+            src/Turso.Data.Sqlite/bin/Release/Turso.Data.Sqlite.Provider.*.nupkg
+            src/Turso.EntityFrameworkCore.Sqlite/bin/Release/Turso.EntityFrameworkCore.Sqlite.*.nupkg
+            src/Turso.Data.Sqlite.NativeAot/bin/Release/Turso.Data.NativeAot.*.nupkg
+            src/Turso.Platform.Client/bin/Release/Turso.Platform.Client.*.nupkg
+            src/Turso.Serverless.Client/bin/Release/Turso.Serverless.Client.*.nupkg
+          )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No NuGet packages found"
+            exit 1
+          fi
+          cp "${files[@]}" "$upstream_dir/"
+          ls -l "$upstream_dir"
+
+      - name: Re-vendor packages as Devolutions
+        shell: pwsh
+        working-directory: .
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $VendorArgs = @{
+            InputDirectory = './output/upstream-packages'
+            OutputDirectory = './output/nuget'
+            PackageVersion = '${{ needs.preflight.outputs.package-version }}'
+            UpstreamVersion = $Env:TURSO_VERSION
+            VendorIdPrefix = $Env:PACKAGE_ID_PREFIX
+            VendorName = $Env:PACKAGE_VENDOR_NAME
+            RepositoryUrl = "${{ github.server_url }}/${{ github.repository }}"
+            RepositoryCommit = '${{ github.sha }}'
+          }
+          ./eng/Vendor-TursoPackages.ps1 @VendorArgs
+
+          $Leaked = @(Get-ChildItem ./output/nuget -Filter 'Turso.*.nupkg')
+          if ($Leaked.Count -gt 0) {
+            throw "Upstream package IDs leaked into the vendored output: $($Leaked.Name -join ', ')"
+          }
+
+      - name: Upload vendored NuGet packages
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ needs.preflight.outputs.release-package-artifact }}
+          path: output/nuget/*.nupkg
+          if-no-files-found: error
+
+  validate-nativeaot-static-package:
+    name: Validate NativeAOT ${{ matrix.rid }}
+    needs: [preflight, pack]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            rid: win-x64
+            executable: NativeAotSample.exe
+
+          - os: windows-11-arm
+            rid: win-arm64
+            executable: NativeAotSample.exe
+
+          - os: ubuntu-24.04
+            rid: linux-x64
+            executable: NativeAotSample
+
+          - os: ubuntu-24.04-arm
+            rid: linux-arm64
+            executable: NativeAotSample
+
+          - os: macos-26-intel
+            rid: osx-x64
+            executable: NativeAotSample
+
+          - os: macos-26
+            rid: osx-arm64
+            executable: NativeAotSample
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Enable git long paths
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
+      - name: Clone project with Turso submodule
+        uses: actions/checkout@v7.0.0
+        with:
+          submodules: true
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v5.3.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download vendored NuGet packages
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ needs.preflight.outputs.release-package-artifact }}
+          path: output/nuget
+
+      - name: Publish NativeAOT sample from vendored packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PackageVersion = '${{ needs.preflight.outputs.package-version }}'
+          $SampleDirectory = "$Env:TURSO_DOTNET_DIR/samples/NativeAot"
+          $SampleProject = "$SampleDirectory/NativeAotSample.csproj"
+          $PackageSource = (Resolve-Path ./output/nuget).Path
+          $PublishDirectory = "${{ runner.temp }}/nativeaot-${{ matrix.rid }}"
+          $NuGetConfig = "$SampleDirectory/NuGet.config"
+
+          # The upstream sample references upstream package IDs; point it at the vendored IDs.
+          $Project = Get-Content -LiteralPath $SampleProject -Raw
+          $Project.Replace('Include="Turso.', "Include=`"$Env:PACKAGE_ID_PREFIX") | Set-Content -LiteralPath $SampleProject -NoNewline
+
+          @"
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="$PackageSource" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+            <packageSourceMapping>
+              <packageSource key="local">
+                <package pattern="$($Env:PACKAGE_ID_PREFIX)*" />
+              </packageSource>
+              <packageSource key="nuget.org">
+                <package pattern="*" />
+              </packageSource>
+            </packageSourceMapping>
+          </configuration>
+          "@ | Set-Content -Path $NuGetConfig -Encoding UTF8
+
+          dotnet restore $SampleProject -r "${{ matrix.rid }}" --configfile $NuGetConfig "-p:TursoPackageVersion=$PackageVersion"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          dotnet publish $SampleProject -c Release -r "${{ matrix.rid }}" -o $PublishDirectory --no-restore "-p:TursoPackageVersion=$PackageVersion"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          $Sidecars = Get-ChildItem -Path $PublishDirectory -Recurse -File |
+            Where-Object { $_.Name -in @("turso_sdk_kit.dll", "libturso_sdk_kit.so", "libturso_sdk_kit.dylib") }
+          if ($Sidecars) {
+            throw "NativeAOT publish produced a Turso dynamic sidecar: $($Sidecars.FullName -join ', ')"
+          }
+
+          $Executable = Join-Path $PublishDirectory "${{ matrix.executable }}"
+          if (-not (Test-Path $Executable)) {
+            throw "NativeAOT executable was not produced at $Executable"
+          }
+
+          if (-not $IsWindows) {
+            chmod +x $Executable
+          }
+
+          $Output = & $Executable
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          foreach ($ExpectedLine in @("Rows: 3", "Checkpoint: complete", "Disposed: complete")) {
+            if ($Output -notcontains $ExpectedLine) {
+              throw "NativeAOT sample did not print '$ExpectedLine': $Output"
+            }
+          }
+
+  validate-android-package:
+    name: Validate Android package
+    needs: [preflight, pack]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ env.TURSO_DOTNET_DIR }}
+
+    steps:
+      - name: Clone project with Turso submodule
+        uses: actions/checkout@v7.0.0
+        with:
+          submodules: true
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v5.3.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+
+      - name: Install Android workload and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet workload install android
+          sdkmanager --install "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Download vendored NuGet packages
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ needs.preflight.outputs.release-package-artifact }}
+          path: output/nuget
+
+      - name: Build Android package consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_source=$(realpath "$GITHUB_WORKSPACE/output/nuget")
+          project=samples/MobilePackageConsumer/Android/AndroidPackageConsumer.csproj
+          sed -i "s/Include=\"Turso\./Include=\"${PACKAGE_ID_PREFIX}/g" "$project"
+          nuget_config=samples/MobilePackageConsumer/NuGet.config
+          cat > "$nuget_config" <<EOF
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="$package_source" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+            <packageSourceMapping>
+              <packageSource key="local">
+                <package pattern="${PACKAGE_ID_PREFIX}*" />
+              </packageSource>
+              <packageSource key="nuget.org">
+                <package pattern="*" />
+              </packageSource>
+            </packageSourceMapping>
+          </configuration>
+          EOF
+
+          version='${{ needs.preflight.outputs.package-version }}'
+          dotnet restore "$project" -r android-arm64 --configfile "$nuget_config" -p:TursoPackageVersion="$version"
+          dotnet build "$project" -c Release -f net10.0-android -r android-arm64 \
+            --no-restore -t:SignAndroidPackage -p:AndroidPackageFormats=apk -p:TursoPackageVersion="$version"
+
+      - name: Verify Android native asset and sync exports
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=$(find samples/MobilePackageConsumer/Android/bin/Release -path '*android-arm64*' -name '*-Signed.apk' -print -quit)
+          if [ -z "$apk" ]; then
+            apk=$(find samples/MobilePackageConsumer/Android/bin/Release -name '*-Signed.apk' -print -quit)
+          fi
+          if [ -z "$apk" ]; then
+            echo "Android package consumer did not produce a signed APK"
+            exit 1
+          fi
+          echo "Checking Android APK $apk"
+
+          native_entry=lib/arm64-v8a/libturso_sdk_kit.so
+          if ! unzip -Z1 "$apk" | grep -Fxq "$native_entry"; then
+            echo "$apk does not contain $native_entry"
+            unzip -Z1 "$apk" | grep -E 'lib/|\.so$' || true
+            exit 1
+          fi
+
+          mkdir -p artifacts/mobile-android
+          unzip -p "$apk" "$native_entry" > artifacts/mobile-android/libturso_sdk_kit.so
+          python3 scripts/check_elf_dynsym_exports.py artifacts/mobile-android/libturso_sdk_kit.so \
+            turso_sync_database_new \
+            turso_sync_database_create \
+            turso_sync_database_open \
+            turso_sync_database_connect \
+            turso_sync_database_stats \
+            turso_sync_database_checkpoint \
+            turso_sync_database_deinit
+
+  validate-ios-package:
+    name: Validate iOS package
+    needs: [preflight, pack]
+    runs-on: macos-26
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ env.TURSO_DOTNET_DIR }}
+
+    steps:
+      - name: Clone project with Turso submodule
+        uses: actions/checkout@v7.0.0
+        with:
+          submodules: true
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v5.3.0
+        with:
+          dotnet-version: 10.0.x
+
+      # Workload set 10.0.401.1 moved the iOS SDK to 27.0, which requires
+      # Xcode 27. The macos-26 runner image only ships Xcode 26.x, so stay on
+      # the last workload set whose iOS SDK (26.5) builds with Xcode 26.
+      - name: Install iOS workload
+        run: dotnet workload install ios --version 10.0.401
+
+      - name: Download vendored NuGet packages
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ needs.preflight.outputs.release-package-artifact }}
+          path: output/nuget
+
+      - name: Build iOS package consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_source=$(realpath "$GITHUB_WORKSPACE/output/nuget")
+          project=samples/MobilePackageConsumer/iOS/IosPackageConsumer.csproj
+          sed -i '' "s/Include=\"Turso\./Include=\"${PACKAGE_ID_PREFIX}/g" "$project"
+          nuget_config=samples/MobilePackageConsumer/NuGet.config
+          cat > "$nuget_config" <<EOF
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="$package_source" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+            <packageSourceMapping>
+              <packageSource key="local">
+                <package pattern="${PACKAGE_ID_PREFIX}*" />
+              </packageSource>
+              <packageSource key="nuget.org">
+                <package pattern="*" />
+              </packageSource>
+            </packageSourceMapping>
+          </configuration>
+          EOF
+
+          version='${{ needs.preflight.outputs.package-version }}'
+          dotnet restore "$project" -r iossimulator-arm64 --configfile "$nuget_config" -p:TursoPackageVersion="$version"
+          dotnet build "$project" -c Release -f net10.0-ios -r iossimulator-arm64 --no-restore \
+            -p:CodesignKey= -p:CodesignProvision= -p:TursoPackageVersion="$version"
+
+      - name: Verify iOS native asset and sync exports
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=$(find samples/MobilePackageConsumer/iOS/bin/Release -name '*.app' -type d -print -quit)
+          if [ -z "$app" ]; then
+            echo "iOS package consumer did not produce an app bundle"
+            exit 1
+          fi
+
+          framework="$app/Frameworks/libturso_sdk_kit.framework/libturso_sdk_kit"
+          if [ ! -f "$framework" ]; then
+            echo "$app does not contain the libturso_sdk_kit framework"
+            exit 1
+          fi
+
+          for symbol in \
+            turso_sync_database_new \
+            turso_sync_database_create \
+            turso_sync_database_open \
+            turso_sync_database_connect \
+            turso_sync_database_stats \
+            turso_sync_database_checkpoint \
+            turso_sync_database_deinit
+          do
+            if ! nm -gU "$framework" | grep -Eq "[[:space:]]_${symbol}$"; then
+              echo "iOS package asset does not export $symbol"
+              exit 1
+            fi
+          done

@@ -1,0 +1,6 @@
+turso-src-worktree/
+output/
+patchsets/
+rs_compiled/
+*.nupkg
+*.snupkg
