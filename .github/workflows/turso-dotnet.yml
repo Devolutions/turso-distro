@@ -372,14 +372,12 @@ jobs:
         with:
           submodules: true
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      # turso-src/rust-toolchain.toml pins the toolchain; add the target to it.
-      - name: Add target
-        run: rustup target add ${{ matrix.target }}
+      # Runner images ship rustup; turso-src/rust-toolchain.toml pins the
+      # toolchain, so install that one and add the target to it.
+      - name: Install Rust toolchain and target
+        run: |
+          rustup toolchain install --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
 
       - name: Setup MSVC
         if: matrix.target == 'x86_64-pc-windows-msvc'
@@ -393,17 +391,13 @@ jobs:
           workspaces: "turso-src -> bindings/dotnet/rs_compiled"
           cache-on-failure: true
 
-      - name: Set up Android SDK
-        if: contains(matrix.target, 'linux-android')
-        uses: android-actions/setup-android@v4
-        with:
-          packages: ''
-
+      # Runner images ship the Android SDK with licenses accepted; only the
+      # pinned NDK needs installing.
       - name: Install Android NDK
         if: contains(matrix.target, 'linux-android')
         shell: bash
         run: |
-          sdkmanager --install "ndk;27.2.12479018"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
@@ -843,17 +837,12 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: ''
-
       - name: Install Android workload and NDK
         shell: bash
         run: |
           set -euo pipefail
           dotnet workload install android
-          sdkmanager --install "ndk;27.2.12479018"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
