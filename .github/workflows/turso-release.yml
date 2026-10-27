@@ -223,7 +223,10 @@ jobs:
             Write-Host "Dry Run: skipping GitHub release!"
           } else {
             $ReleaseAssets = @($ReleaseAssetFiles | ForEach-Object { $_.Name }) + $HashPath
-            $PrereleaseArgs = if ('${{ needs.build.outputs.turso-version }}' -match '-') { @('--prerelease') } else { @() }
+            $PrereleaseArgs = @()
+            if ('${{ needs.build.outputs.turso-version }}' -match '-') {
+              $PrereleaseArgs += '--prerelease'
+            }
             & gh release create $ReleaseTag --repo $Repository --target $Env:GITHUB_SHA --title $ReleaseTitle --notes-file $NotesPath @PrereleaseArgs @ReleaseAssets
             if ($LASTEXITCODE -ne 0) {
               throw "gh release create failed for $ReleaseTag with exit code $LASTEXITCODE"
