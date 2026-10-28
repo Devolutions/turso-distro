@@ -8,9 +8,24 @@ namespace Turso.Raw.Public;
 public static class TursoBindings
 {
     public static TursoDatabaseHandle OpenDatabase(string path)
+        => OpenDatabase(path, experimentalFeatures: null);
+
+    /// <summary>
+    /// Opens a database with the engine's experimental features in <paramref name="experimentalFeatures"/> enabled.
+    /// </summary>
+    /// <param name="path">The path to the database file.</param>
+    /// <param name="experimentalFeatures">
+    /// A comma-separated list of engine feature names, for example <c>autovacuum,vacuum</c>, or
+    /// <see langword="null"/>. The engine ignores names it does not know.
+    /// </param>
+    /// <remarks>
+    /// The engine shares one database per file within a process, so while a connection to the file is
+    /// open, a later open joins it with the features it was first opened with.
+    /// </remarks>
+    public static TursoDatabaseHandle OpenDatabase(string path, string? experimentalFeatures)
     {
         ArgumentNullException.ThrowIfNull(path);
-        return OpenDatabase(path, cipher: null, hexkey: null);
+        return OpenDatabase(path, cipher: null, hexkey: null, experimentalFeatures: experimentalFeatures);
     }
 
     /// <summary>
@@ -21,11 +36,22 @@ public static class TursoBindings
     /// <param name="hexkey">The hex-encoded encryption key.</param>
     /// <returns>A handle to the opened database.</returns>
     public static TursoDatabaseHandle OpenDatabaseWithEncryption(string path, TursoEncryptionCipher cipher, string hexkey)
+        => OpenDatabaseWithEncryption(path, cipher, hexkey, experimentalFeatures: null);
+
+    /// <summary>
+    /// Opens a database with local encryption and the experimental features in
+    /// <paramref name="experimentalFeatures"/>; <c>encryption</c> is always enabled.
+    /// </summary>
+    public static TursoDatabaseHandle OpenDatabaseWithEncryption(
+        string path,
+        TursoEncryptionCipher cipher,
+        string hexkey,
+        string? experimentalFeatures)
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(hexkey);
 
-        return OpenDatabase(path, cipher.ToRustString(), hexkey);
+        return OpenDatabase(path, cipher.ToRustString(), hexkey, experimentalFeatures: experimentalFeatures);
     }
 
     /// <summary>
@@ -35,22 +61,42 @@ public static class TursoBindings
     /// The engine keeps a reference to the codec until the last connection to the database closes.
     /// </remarks>
     public static TursoDatabaseHandle OpenDatabaseWithPageCodec(string path, ITursoPageCodec pageCodec)
+        => OpenDatabaseWithPageCodec(path, pageCodec, experimentalFeatures: null);
+
+    /// <summary>
+    /// Opens a database whose pages go through <paramref name="pageCodec"/>, with the experimental
+    /// features in <paramref name="experimentalFeatures"/> enabled.
+    /// </summary>
+    public static TursoDatabaseHandle OpenDatabaseWithPageCodec(
+        string path,
+        ITursoPageCodec pageCodec,
+        string? experimentalFeatures)
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(pageCodec);
 
-        return OpenDatabase(path, cipher: null, hexkey: null, pageCodec, readOnly: false);
+        return OpenDatabase(path, cipher: null, hexkey: null, pageCodec, readOnly: false, experimentalFeatures);
     }
 
     /// <summary>
     /// Opens a database read-only, with its pages decoded by <paramref name="pageCodec"/>.
     /// </summary>
     public static TursoDatabaseHandle OpenDatabaseReadOnlyWithPageCodec(string path, ITursoPageCodec pageCodec)
+        => OpenDatabaseReadOnlyWithPageCodec(path, pageCodec, experimentalFeatures: null);
+
+    /// <summary>
+    /// Opens a database read-only, with its pages decoded by <paramref name="pageCodec"/> and the
+    /// experimental features in <paramref name="experimentalFeatures"/> enabled.
+    /// </summary>
+    public static TursoDatabaseHandle OpenDatabaseReadOnlyWithPageCodec(
+        string path,
+        ITursoPageCodec pageCodec,
+        string? experimentalFeatures)
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(pageCodec);
 
-        return OpenDatabase(path, cipher: null, hexkey: null, pageCodec, readOnly: true);
+        return OpenDatabase(path, cipher: null, hexkey: null, pageCodec, readOnly: true, experimentalFeatures);
     }
 
     /// <summary>
@@ -60,8 +106,7 @@ public static class TursoBindings
     {
         ArgumentNullException.ThrowIfNull(path);
 
-        var databasePtr = NewOpenedDatabase(path, cipher: null, hexkey: null, pageCodec: null, readOnly: false);
-        return TursoSharedDatabaseHandle.FromPtr(databasePtr);
+        return OpenSharedDatabase(path, pageCodec: null, experimentalFeatures: null);
     }
 
     /// <summary>
@@ -73,7 +118,22 @@ public static class TursoBindings
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(pageCodec);
 
-        var databasePtr = NewOpenedDatabase(path, cipher: null, hexkey: null, pageCodec, readOnly: false);
+        return OpenSharedDatabase(path, pageCodec, experimentalFeatures: null);
+    }
+
+    /// <summary>
+    /// Opens a database that can be shared by several connections, with its pages going through
+    /// <paramref name="pageCodec"/> when one is given, and the experimental features in
+    /// <paramref name="experimentalFeatures"/> enabled.
+    /// </summary>
+    public static TursoSharedDatabaseHandle OpenSharedDatabase(
+        string path,
+        ITursoPageCodec? pageCodec,
+        string? experimentalFeatures)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+
+        var databasePtr = NewOpenedDatabase(path, cipher: null, hexkey: null, pageCodec, readOnly: false, experimentalFeatures);
         return TursoSharedDatabaseHandle.FromPtr(databasePtr);
     }
 
@@ -395,9 +455,10 @@ public static class TursoBindings
         string? cipher,
         string? hexkey,
         ITursoPageCodec? pageCodec = null,
-        bool readOnly = false)
+        bool readOnly = false,
+        string? experimentalFeatures = null)
     {
-        var databasePtr = NewOpenedDatabase(path, cipher, hexkey, pageCodec, readOnly);
+        var databasePtr = NewOpenedDatabase(path, cipher, hexkey, pageCodec, readOnly, experimentalFeatures);
         var connectionPtr = IntPtr.Zero;
         try
         {
@@ -420,10 +481,13 @@ public static class TursoBindings
         string? cipher,
         string? hexkey,
         ITursoPageCodec? pageCodec,
-        bool readOnly)
+        bool readOnly,
+        string? experimentalFeatures)
     {
         using var pathString = NativeUtf8String.From(path);
-        using var featuresString = NativeUtf8String.From(cipher is null ? null : "encryption");
+        using var featuresString = NativeUtf8String.From(MergeExperimentalFeatures(
+            experimentalFeatures,
+            cipher is null ? null : "encryption"));
         using var cipherString = NativeUtf8String.From(cipher);
         using var hexkeyString = NativeUtf8String.From(hexkey);
 
@@ -476,6 +540,19 @@ public static class TursoBindings
                 TursoInterop.DatabaseDeinit(databasePtr);
             throw;
         }
+    }
+
+    // The engine reads a comma-separated list of lowercase names and ignores the ones it does not know.
+    private static string? MergeExperimentalFeatures(string? experimentalFeatures, string? requiredFeature)
+    {
+        var features = (experimentalFeatures ?? string.Empty)
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(feature => feature.ToLowerInvariant())
+            .Append(requiredFeature)
+            .OfType<string>()
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        return features.Length == 0 ? null : string.Join(",", features);
     }
 
     private static void BindParameterAt(TursoStatementHandle statement, int index, TursoValue value)

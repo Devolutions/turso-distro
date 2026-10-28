@@ -79,6 +79,12 @@ public class TursoConnectionOptions
 
     public string SyncExperimentalFeatures => _builder.SyncExperimentalFeatures;
 
+    /// <summary>
+    /// The <c>Experimental Features</c> list, trimmed, lowercased, deduplicated and sorted, or
+    /// <see langword="null"/> when it names none.
+    /// </summary>
+    public string? ExperimentalFeatures => NormalizeExperimentalFeatures(_builder.ExperimentalFeatures);
+
     public bool? Tls => _builder.Tls;
 
     public bool IsRemote => IsRemoteDataSource(DataSource);
@@ -107,6 +113,18 @@ public class TursoConnectionOptions
         || HasOption("Partial Sync Prefetch");
 
     public TursoEncryptionCipher? GetEncryptionCipher() => _builder.GetEncryptionCipher();
+
+    // One spelling per feature set, so it can key databases shared between connections.
+    internal static string? NormalizeExperimentalFeatures(string? value)
+    {
+        var features = (value ?? string.Empty)
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(feature => feature.ToLowerInvariant())
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        return features.Length == 0 ? null : string.Join(",", features);
+    }
 
     public TursoRemoteEncryptionOptions? GetRemoteEncryption()
     {

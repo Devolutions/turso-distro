@@ -32,6 +32,8 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         ["EncryptionCipher"] = "Encryption Cipher",
         ["Encryption Key"] = "Encryption Key",
         ["EncryptionKey"] = "Encryption Key",
+        ["Experimental Features"] = "Experimental Features",
+        ["ExperimentalFeatures"] = "Experimental Features",
         ["Auth Token"] = "Auth Token",
         ["AuthToken"] = "Auth Token",
         ["Authentication Token"] = "Auth Token",
@@ -160,6 +162,19 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
     {
         get => GetString("Encryption Key");
         set => SetString("Encryption Key", value);
+    }
+
+    /// <summary>
+    /// A comma-separated list of experimental engine features to enable on a local database, for example
+    /// <c>autovacuum</c> (needed for <c>PRAGMA auto_vacuum</c>, and to open a database that uses it
+    /// read-write) or <c>vacuum</c> (needed for <c>VACUUM</c>). <c>encryption</c> is added when
+    /// <c>Encryption Cipher</c> is set. The engine shares one database per file within a process, so
+    /// every connection to a file must use the same features.
+    /// </summary>
+    public string ExperimentalFeatures
+    {
+        get => GetString("Experimental Features");
+        set => SetString("Experimental Features", value);
     }
 
     public string AuthToken

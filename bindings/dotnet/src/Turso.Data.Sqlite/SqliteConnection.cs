@@ -190,14 +190,16 @@ public partial class SqliteConnection : DbConnection
         var originalState = State;
         var filename = NormalizeDataSource(_connectionOptions);
         var readOnly = _connectionOptions.Mode == SqliteOpenMode.ReadOnly;
+        var experimentalFeatures = global::Turso.TursoConnectionOptions.NormalizeExperimentalFeatures(
+            _connectionOptions.ExperimentalFeatures);
         var sharedMemoryPath = IsSharedMemory(_connectionOptions) ? RegisterSharedMemoryFile(filename) : null;
         try
         {
             _database = CanPool(_connectionOptions, filename, sharedMemoryPath)
-                ? SqliteDatabasePool.Connect(filename, _pageCodec)
+                ? SqliteDatabasePool.Connect(filename, _pageCodec, experimentalFeatures)
                 : _pageCodec is null
-                    ? TursoBindings.OpenDatabase(filename)
-                    : TursoBindings.OpenDatabaseWithPageCodec(filename, _pageCodec);
+                    ? TursoBindings.OpenDatabase(filename, experimentalFeatures)
+                    : TursoBindings.OpenDatabaseWithPageCodec(filename, _pageCodec, experimentalFeatures);
             _dataSource = filename;
             _readOnly = readOnly;
             _sharedMemoryPath = sharedMemoryPath;
