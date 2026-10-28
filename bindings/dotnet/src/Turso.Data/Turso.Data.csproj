@@ -5,6 +5,7 @@
     <TargetFrameworks>$(TursoTargetFrameworks)</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <IsAotCompatible>true</IsAotCompatible>
     <RootNamespace>Turso</RootNamespace>
     
     <PackageId>Turso.Data.Common</PackageId>

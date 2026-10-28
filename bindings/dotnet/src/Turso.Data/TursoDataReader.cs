@@ -2,6 +2,7 @@ using System.Collections;
 using System.ComponentModel;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -16,7 +17,7 @@ public class TursoDataReader : DbDataReader
     private readonly TursoCommand _command;
     private readonly TursoStatementHandle _statement;
     private readonly CommandBehavior _behavior;
-    private readonly Type?[] _fieldTypes;
+    private readonly TursoValueType[] _fieldValueTypes; // Empty = not yet resolved
     private IDisposable? _syncOperation;
     private TursoConnection? _syncConnection;
     private bool _isClosed;
@@ -36,7 +37,7 @@ public class TursoDataReader : DbDataReader
         _statement = statement;
         _behavior = behavior;
         _syncOperation = syncOperation;
-        _fieldTypes = new Type?[TursoBindings.GetFieldCount(statement)];
+        _fieldValueTypes = new TursoValueType[TursoBindings.GetFieldCount(statement)];
         if (syncOperation is not null && command.Connection is TursoConnection connection)
         {
             _syncConnection = connection;
@@ -109,34 +110,27 @@ public class TursoDataReader : DbDataReader
         return TursoBindings.GetValue(_statement, ordinal).RealValue;
     }
 
+    [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
     public override Type GetFieldType(int ordinal)
     {
         EnsureOpen();
         ValidateOrdinal(ordinal);
-        if (_fieldTypes[ordinal] is { } fieldType)
-            return fieldType;
+        var valueType = _fieldValueTypes[ordinal];
+        if (valueType is not TursoValueType.Empty)
+            return DataReaderCompatibility.GetClrType(valueType);
 
         var declaredType = TursoBindings.GetDeclaredTypeName(_statement, ordinal);
-        if (DataReaderCompatibility.TryGetClrTypeFromDeclaredType(declaredType, out fieldType))
+        if (DataReaderCompatibility.TryGetValueTypeFromDeclaredType(declaredType, out valueType))
         {
-            _fieldTypes[ordinal] = fieldType;
-            return fieldType;
+            _fieldValueTypes[ordinal] = valueType;
+            return DataReaderCompatibility.GetClrType(valueType);
         }
 
-        var value = TursoBindings.GetValue(_statement, ordinal);
-        fieldType = value.ValueType switch
-        {
-            TursoValueType.Integer => typeof(long),
-            TursoValueType.Real => typeof(double),
-            TursoValueType.Text => typeof(string),
-            TursoValueType.Blob => typeof(byte[]),
-            _ => typeof(object)
-        };
+        valueType = TursoBindings.GetValue(_statement, ordinal).ValueType;
+        if (valueType is not TursoValueType.Null and not TursoValueType.Empty)
+            _fieldValueTypes[ordinal] = valueType;
 
-        if (value.ValueType is not TursoValueType.Null and not TursoValueType.Empty)
-            _fieldTypes[ordinal] = fieldType;
-
-        return fieldType;
+        return DataReaderCompatibility.GetClrType(valueType);
     }
 
     public override float GetFloat(int ordinal)
@@ -337,6 +331,10 @@ public class TursoDataReader : DbDataReader
 
 internal static class DataReaderCompatibility
 {
+    // DataColumn annotates its Type parameter, so typeof(Type) keeps System.Type's public
+    // properties, TypeInitializer included. Nothing is reflected over at run time;
+    // Microsoft.Data.Sqlite suppresses the same warning.
+    [UnconditionalSuppressMessage("Trimming", "IL2111", Justification = "System.Type.TypeInitializer is only kept alive by DataColumn's annotation on the column type.")]
     public static DataTable CreateSchemaTable(DbDataReader reader)
     {
         var schema = new DataTable("SchemaTable");
@@ -402,29 +400,48 @@ internal static class DataReaderCompatibility
         return schema;
     }
 
-    public static bool TryGetClrTypeFromDeclaredType(string? declaredType, out Type fieldType)
+    [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
+    public static Type GetClrType(TursoValueType valueType) => valueType switch
     {
-        fieldType = typeof(object);
+        TursoValueType.Integer => typeof(long),
+        TursoValueType.Real => typeof(double),
+        TursoValueType.Text => typeof(string),
+        TursoValueType.Blob => typeof(byte[]),
+        _ => typeof(object),
+    };
+
+    public static bool TryGetValueTypeFromDeclaredType(string? declaredType, out TursoValueType valueType)
+    {
+        valueType = TursoValueType.Empty;
         if (string.IsNullOrWhiteSpace(declaredType))
             return false;
 
         var normalized = declaredType.Trim().ToUpperInvariant();
         if (normalized.Contains("INT", StringComparison.Ordinal))
-            fieldType = typeof(long);
+            valueType = TursoValueType.Integer;
         else if (normalized.Contains("REAL", StringComparison.Ordinal)
                  || normalized.Contains("FLOA", StringComparison.Ordinal)
                  || normalized.Contains("DOUB", StringComparison.Ordinal))
-            fieldType = typeof(double);
+            valueType = TursoValueType.Real;
         else if (normalized.Contains("TEXT", StringComparison.Ordinal)
                  || normalized.Contains("CHAR", StringComparison.Ordinal)
                  || normalized.Contains("CLOB", StringComparison.Ordinal))
-            fieldType = typeof(string);
+            valueType = TursoValueType.Text;
         else if (normalized.Contains("BLOB", StringComparison.Ordinal))
-            fieldType = typeof(byte[]);
+            valueType = TursoValueType.Blob;
         else
             return false;
 
         return true;
+    }
+
+    public static bool TryGetClrTypeFromDeclaredType(
+        string? declaredType,
+        [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)] out Type fieldType)
+    {
+        var found = TryGetValueTypeFromDeclaredType(declaredType, out var valueType);
+        fieldType = GetClrType(valueType);
+        return found;
     }
 
     public static Guid ToGuid(object value)

@@ -1,6 +1,13 @@
+using System.Diagnostics.CodeAnalysis;
+
 namespace Turso.Data.Sqlite;
 
-internal sealed record ManagedSqliteColumn(string Name, string DataTypeName, Type FieldType);
+internal sealed record ManagedSqliteColumn(
+    string Name,
+    string DataTypeName,
+    [property: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
+    [param: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
+    Type FieldType);
 
 internal sealed record ManagedSqliteResult(
     string Sql,

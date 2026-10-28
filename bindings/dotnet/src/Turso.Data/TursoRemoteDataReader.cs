@@ -2,6 +2,7 @@ using System.Collections;
 using System.ComponentModel;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 
 namespace Turso;
@@ -111,6 +112,7 @@ internal sealed class TursoRemoteDataReader : DbDataReader
         return CurrentValue(ordinal).GetDouble();
     }
 
+    [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
     public override Type GetFieldType(int ordinal)
     {
         EnsureOpen();
@@ -362,6 +364,7 @@ internal sealed class TursoRemoteDataReader : DbDataReader
             throw new IndexOutOfRangeException($"column ordinal {ordinal} is out of range");
     }
 
+    [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
     private static Type GetClrType(string valueType)
     {
         return valueType switch

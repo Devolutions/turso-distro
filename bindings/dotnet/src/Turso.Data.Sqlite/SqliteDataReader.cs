@@ -338,7 +338,15 @@ public class SqliteDataReader : DbDataReader
                 return column.FieldType;
 
             var value = GetFirstManagedNonNullValue(ordinal);
-            return value?.GetType() ?? GetClrTypeFromManagedDataType(column.DataTypeName);
+            return value switch
+            {
+                long => typeof(long),
+                double => typeof(double),
+                string => typeof(string),
+                byte[] => typeof(byte[]),
+                Guid => typeof(Guid),
+                _ => GetClrTypeFromManagedDataType(column.DataTypeName),
+            };
         }
 
         var statement = GetStatement();
@@ -527,6 +535,10 @@ public class SqliteDataReader : DbDataReader
         throw new ArgumentOutOfRangeException(nameof(name), name, $"Column {name} was not found.");
     }
 
+    // DataColumn annotates its Type parameter, so typeof(Type) keeps System.Type's public
+    // properties, TypeInitializer included. Nothing is reflected over at run time;
+    // Microsoft.Data.Sqlite suppresses the same warning.
+    [UnconditionalSuppressMessage("Trimming", "IL2111", Justification = "System.Type.TypeInitializer is only kept alive by DataColumn's annotation on the column type.")]
     public override DataTable GetSchemaTable()
     {
         EnsureOpen();
@@ -1019,6 +1031,10 @@ public class SqliteDataReader : DbDataReader
         return null;
     }
 
+    // DataColumn annotates its Type parameter, so typeof(Type) keeps System.Type's public
+    // properties, TypeInitializer included. Nothing is reflected over at run time;
+    // Microsoft.Data.Sqlite suppresses the same warning.
+    [UnconditionalSuppressMessage("Trimming", "IL2111", Justification = "System.Type.TypeInitializer is only kept alive by DataColumn's annotation on the column type.")]
     private DataTable GetManagedSchemaTable()
     {
         var schema = new DataTable("SchemaTable");

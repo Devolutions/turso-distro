@@ -277,17 +277,17 @@ public sealed class TursoBatch : DbBatch
             double number => new RemoteResponseValue
             {
                 Type = "float",
-                Value = JsonSerializer.SerializeToElement(number),
+                Value = JsonSerializer.SerializeToElement(number, TursoRemoteJsonContext.Default.Double),
             },
             long number => new RemoteResponseValue
             {
                 Type = "integer",
-                Value = JsonSerializer.SerializeToElement(number),
+                Value = JsonSerializer.SerializeToElement(number, TursoRemoteJsonContext.Default.Int64),
             },
             string text => new RemoteResponseValue
             {
                 Type = "text",
-                Value = JsonSerializer.SerializeToElement(text),
+                Value = JsonSerializer.SerializeToElement(text, TursoRemoteJsonContext.Default.String),
             },
             _ => throw new InvalidOperationException(
                 $"Cannot buffer a batch value of type {value.GetType().FullName}."),
