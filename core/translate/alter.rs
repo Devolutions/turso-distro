@@ -286,7 +286,7 @@ fn emit_rename_sqlite_sequence_entry(
     connection: &Arc<crate::Connection>,
     database_id: usize,
     old_table_name_norm: &str,
-    new_table_name_norm: &str,
+    new_table_name: &str,
 ) {
     let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
         s.get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
@@ -299,7 +299,7 @@ fn emit_rename_sqlite_sequence_entry(
     let sequence_value_reg = program.alloc_register();
     let row_name_to_replace_reg = program.emit_string8_new_reg(old_table_name_norm.to_string());
     program.mark_last_insn_constant();
-    let replacement_row_name_reg = program.emit_string8_new_reg(new_table_name_norm.to_string());
+    let replacement_row_name_reg = program.emit_string8_new_reg(new_table_name.to_string());
     program.mark_last_insn_constant();
 
     let affinity_str = sqlite_sequence
@@ -318,12 +318,13 @@ fn emit_rename_sqlite_sequence_entry(
         program.emit_column_or_rowid(seq_cursor_id, 0, sequence_name_reg);
 
         let continue_loop_label = program.allocate_label();
+        // Rows keep the table name as written (SQLite does too).
         program.emit_insn(Insn::Ne {
             lhs: sequence_name_reg,
             rhs: row_name_to_replace_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: Some(crate::translate::collate::CollationSeq::NoCase),
         });
 
         program.emit_column_or_rowid(seq_cursor_id, 1, sequence_value_reg);
@@ -403,7 +404,7 @@ fn emit_delete_sqlite_sequence_entry(
             rhs: row_name_to_delete_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: Some(crate::translate::collate::CollationSeq::NoCase),
         });
 
         program.emit_insn(Insn::Delete {
@@ -1720,7 +1721,7 @@ pub fn translate_alter_table(
                 connection,
                 database_id,
                 &normalized_old_name,
-                &normalized_new_name,
+                new_name,
             );
 
             // For AUTOINCREMENT tables, also rewrite the persistent

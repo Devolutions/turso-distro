@@ -218,8 +218,9 @@ pub fn translate_create_trigger(
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for triggers
         SchemaEntryType::Trigger,
-        &normalized_trigger_name,
-        &normalized_table_name,
+        trigger_name.name.as_str(),
+        // SQLite records the target table as the trigger names it.
+        tbl_name.name.as_str(),
         0, // triggers don't have a root page
         Some(sql),
     )?;
@@ -234,7 +235,7 @@ pub fn translate_create_trigger(
     });
 
     // Parse schema to load the new trigger
-    let escaped_trigger_name = escape_sql_string_literal(&normalized_trigger_name);
+    let escaped_trigger_name = escape_sql_string_literal(trigger_name.name.as_str());
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!(
@@ -570,14 +571,14 @@ pub fn translate_drop_trigger(
         collation: program.curr_collation(),
     });
 
-    // Check if name matches
+    // Check if name matches; rows keep the name as written, so fold case.
     let trigger_name_str_reg = program.emit_string8_new_reg(normalized_trigger_name.clone());
     program.emit_insn(Insn::Ne {
         lhs: name_reg,
         rhs: trigger_name_str_reg,
         target_pc: skip_non_trigger_label,
         flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: Some(crate::translate::collate::CollationSeq::NoCase),
     });
 
     // Found it! Delete the row

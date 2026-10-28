@@ -1706,7 +1706,8 @@ fn open_autoincrement_state(
         db: ctx.database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(ctx.table.name.clone());
+    // sqlite_sequence rows carry the table's name as it was created.
+    let table_name_reg = program.emit_string8_new_reg(ctx.table.original_name.clone());
     let r_seq = program.alloc_register();
     let r_seq_rowid = program.alloc_register();
 
@@ -3412,7 +3413,8 @@ fn ensure_sequence_initialized(
         db: database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(table.name.clone());
+    // sqlite_sequence rows carry the table's name as it was created.
+    let table_name_reg = program.emit_string8_new_reg(table.original_name.clone());
 
     let loop_start_label = program.allocate_label();
     let entry_exists_label = program.allocate_label();

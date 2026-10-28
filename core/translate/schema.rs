@@ -1419,14 +1419,16 @@ pub fn translate_create_table(
 
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
 
+    // Like SQLite, sqlite_schema keeps the name as written; lookups fold case.
+    let original_tbl_name = tbl_name.name.as_str();
     emit_schema_entry(
         program,
         resolver,
         sqlite_schema_cursor_id,
         cdc_table.as_ref().map(|x| x.0),
         SchemaEntryType::Table,
-        &normalized_tbl_name,
-        &normalized_tbl_name,
+        original_tbl_name,
+        original_tbl_name,
         table_root_reg,
         Some(sql),
     )?;
@@ -1435,7 +1437,7 @@ pub fn translate_create_table(
         for (idx, index_reg) in index_regs.into_iter().enumerate() {
             let index_name = format!(
                 "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_{}",
-                normalized_tbl_name,
+                original_tbl_name,
                 idx + 1
             );
             emit_schema_entry(
@@ -1445,7 +1447,7 @@ pub fn translate_create_table(
                 None,
                 SchemaEntryType::Index,
                 &index_name,
-                &normalized_tbl_name,
+                original_tbl_name,
                 index_reg,
                 None,
             )?;
@@ -1489,7 +1491,7 @@ pub fn translate_create_table(
         p5: 0,
     });
 
-    let escaped_tbl_name = escape_sql_string_literal(&normalized_tbl_name);
+    let escaped_tbl_name = escape_sql_string_literal(original_tbl_name);
     let mut parse_schema_where_clause = String::with_capacity(
         "tbl_name = '' AND type != 'trigger'".len()
             + escaped_tbl_name.len()
@@ -2079,13 +2081,14 @@ pub fn translate_drop_table(
                 // want to drop. First match jumps to the delete label.
                 let temp_name_reg = program.alloc_register();
                 program.emit_column_or_rowid(temp_cursor, 1, temp_name_reg);
+                // Trigger rows keep the name as written.
                 for name_reg in &name_regs {
                     program.emit_insn(Insn::Eq {
                         lhs: temp_name_reg,
                         rhs: *name_reg,
                         target_pc: temp_delete_label,
                         flags: CmpInsFlags::default(),
-                        collation: None,
+                        collation: Some(CollationSeq::NoCase),
                     });
                 }
                 // No name matched — skip the delete.

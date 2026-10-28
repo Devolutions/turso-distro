@@ -11499,18 +11499,24 @@ pub fn op_function(
                     };
                     let rename_to = normalize_ident(original_rename_to.as_str());
 
-                    let new_name = if let Some(column) =
-                        &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
+                    // Rows keep names as written (SQLite, or this engine since it
+                    // stopped lowercasing them), so match them case-insensitively
+                    // and write the new name as the user wrote it.
+                    let autoindex_prefix = format!("sqlite_autoindex_{rename_from}_");
+                    let new_name = if let Some(column) = name
+                        .get(..autoindex_prefix.len())
+                        .filter(|prefix| prefix.eq_ignore_ascii_case(&autoindex_prefix))
+                        .map(|_| &name[autoindex_prefix.len()..])
                     {
-                        format!("sqlite_autoindex_{rename_to}_{column}")
-                    } else if name == rename_from {
-                        rename_to.clone()
+                        format!("sqlite_autoindex_{}_{column}", original_rename_to.as_str())
+                    } else if name.eq_ignore_ascii_case(&rename_from) {
+                        original_rename_to.to_string()
                     } else {
                         name
                     };
 
-                    let new_tbl_name = if tbl_name == rename_from {
-                        rename_to.clone()
+                    let new_tbl_name = if tbl_name.eq_ignore_ascii_case(&rename_from) {
+                        original_rename_to.to_string()
                     } else {
                         tbl_name
                     };
@@ -16921,6 +16927,7 @@ pub fn op_rename_table(
                 }
 
                 normalized_to.clone_into(&mut btree.name);
+                to.as_str().clone_into(&mut btree.original_name);
             }
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);
@@ -16989,7 +16996,9 @@ pub fn op_rename_table(
             schema.sequences.insert(new_seq_name, seq_arc);
             if let Some(mut backing_arc) = schema.tables.remove(&old_backing_table) {
                 if let Table::BTree(btree_arc) = Arc::make_mut(&mut backing_arc) {
-                    Arc::make_mut(btree_arc).name.clone_from(&new_backing_table);
+                    let btree = Arc::make_mut(btree_arc);
+                    btree.name.clone_from(&new_backing_table);
+                    btree.original_name.clone_from(&new_backing_table);
                 }
                 schema.tables.insert(new_backing_table, backing_arc);
             }

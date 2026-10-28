@@ -713,7 +713,15 @@ pub(crate) fn emit_sqlite_sequence_sync(
         db: database_id,
     });
 
-    let name_reg = program.emit_string8_new_reg(autoinc_table_name.to_string());
+    // Like SQLite, the row carries the table's name as it was created, and
+    // existing rows match whatever case they were written with.
+    let row_name = resolver
+        .with_schema(database_id, |s| {
+            s.get_btree_table(autoinc_table_name)
+                .map(|table| table.original_name.clone())
+        })
+        .unwrap_or_else(|| autoinc_table_name.to_string());
+    let name_reg = program.emit_string8_new_reg(row_name);
 
     // Delete every existing row matching `name = autoinc_table_name`.
     let insert_label = program.allocate_label();
@@ -731,7 +739,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
         rhs: name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: Some(crate::translate::collate::CollationSeq::NoCase),
     });
     program.emit_insn(Insn::Delete {
         cursor_id: sseq_cursor,

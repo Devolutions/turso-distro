@@ -2028,6 +2028,7 @@ impl Schema {
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
+                original_name: view_name.clone(),
                 root_page: main_root,
                 columns: cols,
                 primary_key_columns: vec![],
@@ -2282,7 +2283,9 @@ impl Schema {
                         // Automatic index on primary key and/or unique constraint, e.g.
                         // table|foo|foo|2|CREATE TABLE foo (a text PRIMARY KEY, b)
                         // index|sqlite_autoindex_foo_1|foo|3|
-                        let index_name = name.to_string();
+                        // The row keeps the table's case (sqlite_autoindex_Foo_1);
+                        // in memory, index names are folded like every other name.
+                        let index_name = normalize_ident(name);
                         let table_name = table_name.to_string();
 
                         // Check if this is an index for a DBSP state table
@@ -2336,7 +2339,7 @@ impl Schema {
                         "view '{view_name}' has unparseable SQL in sqlite_schema; \
                          it is unavailable but can be removed with DROP VIEW: {sql}"
                     );
-                    self.broken_views.insert(view_name);
+                    self.broken_views.insert(normalize_ident(&view_name));
                 } else if let Ok(Some(Cmd::Stmt(stmt))) = parsed {
                     match stmt {
                         Stmt::CreateMaterializedView { .. } => {
@@ -2388,7 +2391,8 @@ impl Schema {
                 use turso_parser::parser::Parser;
 
                 let sql = maybe_sql.expect("sql should be present for trigger");
-                let trigger_name = name.to_string();
+                // Rows keep the name as written; in memory, names are folded.
+                let trigger_name = normalize_ident(name);
 
                 let mut parser = Parser::new(sql.as_bytes());
                 let Ok(Some(Cmd::Stmt(Stmt::CreateTrigger {
@@ -2762,6 +2766,7 @@ impl TryClone for BTreeTable {
         Ok(Self {
             root_page: self.root_page,
             name: self.name.clone(),
+            original_name: self.original_name.clone(),
             primary_key_columns: self.primary_key_columns.try_clone()?,
             columns: self.columns.try_clone()?,
             has_rowid: self.has_rowid,
@@ -3367,7 +3372,11 @@ impl GeneratedColGraph {
 #[derive(Clone, Debug)]
 pub struct BTreeTable {
     pub root_page: i64,
+    /// Lookup key: the name with SQLite's ASCII case folding applied.
     pub name: String,
+    /// The name as the user wrote it. `sqlite_schema` rows and regenerated
+    /// `CREATE TABLE` SQL use it, so names keep their case as in SQLite.
+    pub original_name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
     columns: Vec<Column>,
     pub has_rowid: bool,
@@ -3433,6 +3442,7 @@ impl BTreeTable {
             Self::build_logical_to_physical_map(&columns, &primary_key_columns, has_rowid);
         Self {
             root_page,
+            original_name: name.clone(),
             name,
             primary_key_columns,
             columns,
@@ -3625,7 +3635,7 @@ impl BTreeTable {
     /// For example, if a user creates a table like: `CREATE TABLE t              (x)`, we store it as
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
-        let mut sql = format!("CREATE TABLE {} (", quote_ident(&self.name));
+        let mut sql = format!("CREATE TABLE {} (", quote_ident(&self.original_name));
         let needs_pk_inline = self.primary_key_columns.len() == 1
             && self
                 .primary_key_constraint_collation(&self.primary_key_columns[0].0)
@@ -5172,6 +5182,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut table = BTreeTable {
         root_page,
         name: table_name,
+        original_name: tbl_name.to_string(),
         has_rowid,
         primary_key_columns,
         has_autoincrement,
@@ -5890,6 +5901,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
     Ok(BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
+        original_name: "sqlite_schema".to_string(),
         has_rowid: true,
         is_strict: false,
         has_autoincrement: false,
@@ -7022,6 +7034,7 @@ mod tests {
         let table = BTreeTable {
             root_page: 0,
             name: "t1".to_string(),
+            original_name: "t1".to_string(),
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
