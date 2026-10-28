@@ -106,24 +106,25 @@ public class TursoConnection : DbConnection
         var filename = _connectionOptions["Data Source"] ?? ":memory:";
         var cipher = _connectionOptions.GetEncryptionCipher();
         var hexkey = _connectionOptions["Encryption Key"];
+        var experimentalFeatures = _connectionOptions.ExperimentalFeatures;
 
         if (_pageCodec is not null)
         {
             if (cipher.HasValue || !string.IsNullOrWhiteSpace(hexkey))
                 throw new InvalidOperationException("PageCodec cannot be combined with Encryption Cipher or Encryption Key.");
 
-            _turso = TursoBindings.OpenDatabaseWithPageCodec(filename, _pageCodec);
+            _turso = TursoBindings.OpenDatabaseWithPageCodec(filename, _pageCodec, experimentalFeatures);
         }
         else if (cipher.HasValue)
         {
             if (string.IsNullOrWhiteSpace(hexkey))
                 throw new InvalidOperationException("Encryption Key is required when Encryption Cipher is specified.");
 
-            _turso = TursoBindings.OpenDatabaseWithEncryption(filename, cipher.Value, hexkey);
+            _turso = TursoBindings.OpenDatabaseWithEncryption(filename, cipher.Value, hexkey, experimentalFeatures);
         }
         else
         {
-            _turso = TursoBindings.OpenDatabase(filename);
+            _turso = TursoBindings.OpenDatabase(filename, experimentalFeatures);
         }
     }
 
@@ -499,6 +500,8 @@ public class TursoConnection : DbConnection
 
         if (_connectionOptions.GetEncryptionCipher().HasValue || !string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]))
             throw new InvalidOperationException("Encryption Cipher and Encryption Key are local database options and cannot be used with remote Turso URLs.");
+        if (_connectionOptions.ExperimentalFeatures is not null)
+            throw new InvalidOperationException("Experimental Features is a local database option and cannot be used with remote Turso URLs.");
 
         var handler = RemoteMessageHandlerFactory?.Invoke();
         _remoteClient = handler is null
@@ -588,6 +591,12 @@ public class TursoConnection : DbConnection
             throw new InvalidOperationException(
                 "Encryption Cipher and Encryption Key are local database options. "
                 + "Use Remote Encryption Cipher and Remote Encryption Key for embedded replicas.");
+        }
+        if (_connectionOptions.ExperimentalFeatures is not null)
+        {
+            throw new InvalidOperationException(
+                "Experimental Features is a local database option. "
+                + "Use Sync Experimental Features for embedded replicas.");
         }
 
         TursoPartialSyncOptions? partialSync = null;

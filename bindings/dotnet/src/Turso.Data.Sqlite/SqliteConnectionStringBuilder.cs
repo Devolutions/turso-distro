@@ -19,6 +19,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "Default Timeout",
         "Pooling",
         "Vfs",
+        "Experimental Features",
         "Auth Token",
         "Replica Path",
         "Read Your Writes",
@@ -61,6 +62,8 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         ["CommandTimeout"] = "Default Timeout",
         ["Pooling"] = "Pooling",
         ["Vfs"] = "Vfs",
+        ["Experimental Features"] = "Experimental Features",
+        ["ExperimentalFeatures"] = "Experimental Features",
         ["Auth Token"] = "Auth Token",
         ["AuthToken"] = "Auth Token",
         ["Authentication Token"] = "Auth Token",
@@ -231,6 +234,19 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
     {
         get => GetBool("Force Logical MVCC Pull");
         set => this["Force Logical MVCC Pull"] = value;
+    }
+
+    /// <summary>
+    ///     A comma-separated list of experimental engine features to enable on a local database, for
+    ///     example <c>autovacuum</c> (needed for <c>PRAGMA auto_vacuum</c>, and to open a database that
+    ///     uses it read-write) or <c>vacuum</c> (needed for <c>VACUUM</c>). The engine shares one
+    ///     database per file within a process, so every connection to a file must use the same features;
+    ///     a pooled connection that asks for other features than the pooled database throws.
+    /// </summary>
+    public string ExperimentalFeatures
+    {
+        get => GetString("Experimental Features");
+        set => SetString("Experimental Features", value);
     }
 
     public string SyncExperimentalFeatures
@@ -436,6 +452,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "Data Source",
         "Default Timeout",
         "Pooling",
+        "Experimental Features",
         "Auth Token",
         "Replica Path",
         "Read Your Writes",
@@ -575,6 +592,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Default Timeout" => 30,
             "Pooling" => true,
             "Vfs" => null!,
+            "Experimental Features" => string.Empty,
             "Auth Token" => string.Empty,
             "Replica Path" => string.Empty,
             "Read Your Writes" => true,

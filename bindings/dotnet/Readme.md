@@ -295,6 +295,7 @@ Supported common connection string keywords include:
 | `Vfs` | Parsed and preserved for compatibility. |
 | `Encryption Cipher` | Turso local encryption cipher. |
 | `Encryption Key` | Hex-encoded encryption key used with `Encryption Cipher`. |
+| `Experimental Features` | Comma-separated engine features to enable on a local database, for example `autovacuum` (needed for `PRAGMA auto_vacuum`, and to open a database that uses it read-write) or `vacuum` (needed for `VACUUM`). `encryption` is added when `Encryption Cipher` is set. The engine shares one database per file within a process, so every connection to a file must use the same features; a pooled `SqliteConnection` that asks for other features than the pooled database throws until `ClearPool` closes it. Alias: `ExperimentalFeatures`. Use `Sync Experimental Features` for embedded replicas. |
 | `Auth Token` | Bearer token for remote Turso/libSQL URLs. Aliases include `AuthToken` and `Authentication Token`. |
 | `Replica Path` | Local path for an embedded replica of the remote `Data Source`. |
 | `Read Your Writes` | Keeps the remote Hrana session baton across commands. Defaults to `True`. Set `False` for stateless one-shot remote requests. |

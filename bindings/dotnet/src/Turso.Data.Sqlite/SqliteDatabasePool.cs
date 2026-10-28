@@ -14,8 +14,10 @@ namespace Turso.Data.Sqlite;
 /// reused, so this pools databases rather than connections. Each entry also holds one idle anchor
 /// connection: closing the last connection to a database checkpoints the whole WAL, and the anchor
 /// keeps that from happening on every <see cref="SqliteConnection.Close"/>.
-/// Entries are keyed by file and page codec ID, so a connection never joins a database opened with
-/// another codec configuration (for example another key).
+/// Entries are keyed by file, page codec ID and experimental features, so a connection never joins a
+/// database opened with another codec configuration (for example another key). The engine itself
+/// shares one database per file, keeping the features of the first open, so a connection that asks
+/// for other features than an entry already pooled for the file throws instead.
 /// </remarks>
 internal static class SqliteDatabasePool
 {
@@ -25,9 +27,9 @@ internal static class SqliteDatabasePool
     private static readonly Dictionary<Key, Entry> Entries = new(new KeyComparer());
     private static bool _processExitHooked;
 
-    public static TursoDatabaseHandle Connect(string filename, ITursoPageCodec? pageCodec)
+    public static TursoDatabaseHandle Connect(string filename, ITursoPageCodec? pageCodec, string? experimentalFeatures)
     {
-        var key = new Key(Path.GetFullPath(filename), pageCodec?.CodecId);
+        var key = new Key(Path.GetFullPath(filename), pageCodec?.CodecId, experimentalFeatures);
         while (true)
         {
             Entry? entry;
@@ -35,6 +37,7 @@ internal static class SqliteDatabasePool
             {
                 if (!Entries.TryGetValue(key, out entry))
                 {
+                    ThrowIfPooledWithOtherFeatures(key);
                     entry = new Entry();
                     Entries.Add(key, entry);
                 }
@@ -58,9 +61,7 @@ internal static class SqliteDatabasePool
                     TursoSharedDatabaseHandle? database = null;
                     try
                     {
-                        database = pageCodec is null
-                            ? TursoBindings.OpenSharedDatabase(filename)
-                            : TursoBindings.OpenSharedDatabase(filename, pageCodec);
+                        database = TursoBindings.OpenSharedDatabase(filename, pageCodec, experimentalFeatures);
                         entry.Anchor = TursoBindings.Connect(database);
                     }
                     catch
@@ -74,6 +75,23 @@ internal static class SqliteDatabasePool
                 }
 
                 return TursoBindings.Connect(entry.Database);
+            }
+        }
+    }
+
+    // Called with Gate held.
+    private static void ThrowIfPooledWithOtherFeatures(Key key)
+    {
+        foreach (var pooled in Entries.Keys)
+        {
+            if (PathComparer.Equals(pooled.Path, key.Path)
+                && !string.Equals(pooled.ExperimentalFeatures, key.ExperimentalFeatures, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"The pooled database '{key.Path}' was opened with Experimental Features="
+                    + $"'{pooled.ExperimentalFeatures}', and the engine shares one database per file. "
+                    + $"Open it with the same features, or call SqliteConnection.ClearPool first to use "
+                    + $"'{key.ExperimentalFeatures}'.");
             }
         }
     }
@@ -123,13 +141,20 @@ internal static class SqliteDatabasePool
             entry.Release();
     }
 
-    private readonly record struct Key(string Path, TursoPageCodecId? CodecId);
+    private readonly record struct Key(string Path, TursoPageCodecId? CodecId, string? ExperimentalFeatures);
 
     private sealed class KeyComparer : IEqualityComparer<Key>
     {
-        public bool Equals(Key x, Key y) => PathComparer.Equals(x.Path, y.Path) && x.CodecId == y.CodecId;
+        public bool Equals(Key x, Key y)
+            => PathComparer.Equals(x.Path, y.Path)
+               && x.CodecId == y.CodecId
+               && string.Equals(x.ExperimentalFeatures, y.ExperimentalFeatures, StringComparison.Ordinal);
 
-        public int GetHashCode(Key key) => HashCode.Combine(PathComparer.GetHashCode(key.Path), key.CodecId);
+        public int GetHashCode(Key key)
+            => HashCode.Combine(
+                PathComparer.GetHashCode(key.Path),
+                key.CodecId,
+                key.ExperimentalFeatures is null ? 0 : StringComparer.Ordinal.GetHashCode(key.ExperimentalFeatures));
     }
 
     private sealed class Entry
