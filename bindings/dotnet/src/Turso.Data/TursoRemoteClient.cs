@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using Turso.Raw.Public;
 using Turso.Raw.Public.Value;
 
@@ -10,11 +11,6 @@ namespace Turso;
 
 internal sealed class TursoRemoteClient : IDisposable
 {
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-    };
-
     private readonly HttpClient _httpClient;
     private readonly string? _authToken;
     private readonly bool _disposeHttpClient;
@@ -138,7 +134,7 @@ internal sealed class TursoRemoteClient : IDisposable
         using var timeout = CreateTimeout(commandTimeout, cancellationToken);
         var effectiveCancellationToken = timeout?.Token ?? cancellationToken;
 
-        var json = JsonSerializer.Serialize(request, JsonOptions);
+        var json = JsonSerializer.Serialize(request, TursoRemoteJsonContext.Default.RemotePipelineRequest);
         using var content = new StringContent(json, Encoding.UTF8, "application/json");
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, _pipelineUri)
         {
@@ -161,7 +157,7 @@ internal sealed class TursoRemoteClient : IDisposable
 
         try
         {
-            return JsonSerializer.Deserialize<RemotePipelineResponse>(body, JsonOptions)
+            return JsonSerializer.Deserialize(body, TursoRemoteJsonContext.Default.RemotePipelineResponse)
                    ?? throw new TursoException("Remote request returned an empty response.");
         }
         catch (JsonException ex)
@@ -234,7 +230,7 @@ internal sealed class TursoRemoteClient : IDisposable
                     throw new TursoException("Remote request returned an empty ok response.");
                 if (result.Response.Type != "execute")
                     throw new TursoException($"Remote request returned unexpected response type: {result.Response.Type}");
-                statementResult = result.Response.DeserializeResult<RemoteStatementResult>();
+                statementResult = result.Response.DeserializeResult(TursoRemoteJsonContext.Default.RemoteStatementResult);
                 break;
 
             case "error":
@@ -263,7 +259,7 @@ internal sealed class TursoRemoteClient : IDisposable
                 if (result.Response.Type != "batch")
                     throw new TursoException($"Remote batch returned unexpected response type: {result.Response.Type}");
 
-                var batch = result.Response.DeserializeResult<RemoteBatchResult>();
+                var batch = result.Response.DeserializeResult(TursoRemoteJsonContext.Default.RemoteBatchResult);
                 statementResults = ExtractBatchStepResults(batch, expectedCount);
                 break;
 
@@ -395,7 +391,7 @@ internal sealed class TursoRemoteClient : IDisposable
         return builder.Uri;
     }
 
-    private sealed class RemotePipelineRequest
+    internal sealed class RemotePipelineRequest
     {
         [JsonPropertyName("baton")]
         public string? Baton { get; init; }
@@ -404,7 +400,7 @@ internal sealed class TursoRemoteClient : IDisposable
         public List<RemoteStreamRequest> Requests { get; init; } = [];
     }
 
-    private sealed class RemoteStreamRequest
+    internal sealed class RemoteStreamRequest
     {
         [JsonPropertyName("type")]
         public string Type { get; init; } = "";
@@ -442,7 +438,7 @@ internal sealed class TursoRemoteClient : IDisposable
         }
     }
 
-    private sealed class RemoteStatement
+    internal sealed class RemoteStatement
     {
         [JsonPropertyName("sql")]
         public string Sql { get; init; } = "";
@@ -457,19 +453,19 @@ internal sealed class TursoRemoteClient : IDisposable
         public bool WantRows { get; init; }
     }
 
-    private sealed class RemoteBatch
+    internal sealed class RemoteBatch
     {
         [JsonPropertyName("steps")]
         public List<RemoteBatchStep> Steps { get; init; } = [];
     }
 
-    private sealed class RemoteBatchStep
+    internal sealed class RemoteBatchStep
     {
         [JsonPropertyName("stmt")]
         public RemoteStatement Statement { get; init; } = new();
     }
 
-    private sealed class RemoteNamedArg
+    internal sealed class RemoteNamedArg
     {
         [JsonPropertyName("name")]
         public string Name { get; init; } = "";
@@ -478,7 +474,7 @@ internal sealed class TursoRemoteClient : IDisposable
         public RemoteRequestValue Value { get; init; } = RemoteRequestValue.Null();
     }
 
-    private sealed class RemoteRequestValue
+    internal sealed class RemoteRequestValue
     {
         [JsonPropertyName("type")]
         public string Type { get; init; } = "";
@@ -560,14 +556,14 @@ internal sealed class RemoteStreamResponse
     [JsonPropertyName("result")]
     public JsonElement Result { get; init; }
 
-    public T DeserializeResult<T>()
+    public T DeserializeResult<T>(JsonTypeInfo<T> typeInfo)
     {
         if (Result.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
             throw new TursoException($"Remote response {Type} did not include a result.");
 
         try
         {
-            return Result.Deserialize<T>()
+            return Result.Deserialize(typeInfo)
                    ?? throw new TursoException($"Remote response {Type} returned an empty result.");
         }
         catch (JsonException ex)

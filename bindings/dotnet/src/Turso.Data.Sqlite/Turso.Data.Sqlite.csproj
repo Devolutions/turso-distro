@@ -5,6 +5,7 @@
     <TargetFrameworks>$(TursoTargetFrameworks)</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <IsAotCompatible>true</IsAotCompatible>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>Turso.Data.Sqlite</RootNamespace>
 
