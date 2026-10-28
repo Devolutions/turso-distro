@@ -152,8 +152,10 @@ pub fn translate_create_trigger(
         when_clause,
         commands,
     );
-    let mangled_trigger_name = resolver.mangle_name(namespace, &normalized_trigger_name);
-    let mangled_table_name = resolver.mangle_name(target_table_namespace, &normalized_table_name);
+    // Like SQLite, the row keeps the trigger name as written, and records the
+    // target table as the trigger names it.
+    let mangled_trigger_name = resolver.mangle_name(namespace, trigger_name.name.as_str());
+    let mangled_table_name = resolver.mangle_name(target_table_namespace, tbl_name.name.as_str());
     // Temp triggers are allowed to reference tables in other databases.
     if target_table_database_id != database_id && database_id != crate::TEMP_DB_ID {
         let table_db_name = tbl_name
@@ -634,7 +636,7 @@ pub fn translate_drop_trigger(
         collation: CollationSeq::for_internal_values(),
     });
 
-    // Check if name matches
+    // Check if name matches; rows keep the name as written, so fold case.
     let trigger_name_str_reg =
         program.emit_string8_new_reg(resolver.mangle_name(namespace, &normalized_trigger_name));
     program.emit_insn(Insn::Ne {
@@ -642,7 +644,7 @@ pub fn translate_drop_trigger(
         rhs: trigger_name_str_reg,
         target_pc: skip_non_trigger_label,
         flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
+        collation: CollationSeq::NoCase,
     });
 
     // Found it! Delete the row

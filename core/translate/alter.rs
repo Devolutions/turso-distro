@@ -285,7 +285,7 @@ fn emit_rename_sqlite_sequence_entry(
     connection: &Arc<crate::Connection>,
     database_id: usize,
     old_table_name_norm: &str,
-    new_table_name_norm: &str,
+    new_table_name: &str,
 ) {
     let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
         s.get_btree_table(NamespaceId::ROOT, crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
@@ -298,7 +298,7 @@ fn emit_rename_sqlite_sequence_entry(
     let sequence_value_reg = program.alloc_register();
     let row_name_to_replace_reg = program.emit_string8_new_reg(old_table_name_norm.to_string());
     program.mark_last_insn_constant();
-    let replacement_row_name_reg = program.emit_string8_new_reg(new_table_name_norm.to_string());
+    let replacement_row_name_reg = program.emit_string8_new_reg(new_table_name.to_string());
     program.mark_last_insn_constant();
 
     let affinity_str = sqlite_sequence
@@ -317,12 +317,13 @@ fn emit_rename_sqlite_sequence_entry(
         program.emit_column_or_rowid(seq_cursor_id, 0, sequence_name_reg);
 
         let continue_loop_label = program.allocate_label();
+        // Rows keep the table name as written (SQLite does too).
         program.emit_insn(Insn::Ne {
             lhs: sequence_name_reg,
             rhs: row_name_to_replace_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::for_internal_values(),
+            collation: CollationSeq::NoCase,
         });
 
         program.emit_column_or_rowid(seq_cursor_id, 1, sequence_value_reg);
@@ -402,7 +403,7 @@ fn emit_delete_sqlite_sequence_entry(
             rhs: row_name_to_delete_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::for_internal_values(),
+            collation: CollationSeq::NoCase,
         });
 
         program.emit_insn(Insn::Delete {
@@ -1042,7 +1043,9 @@ pub fn translate_alter_table(
 
             btree.columns_mut().remove(dropped_index);
 
-            let sql = escape_sql_string_literal(&btree.to_sql_as(&mangled_table_name));
+            let sql = escape_sql_string_literal(
+                &btree.to_sql_as(&resolver.mangle_name(namespace, &btree.original_name)),
+            );
 
             let escaped_table_name = escape_sql_string_literal(&mangled_table_name);
             let stmt = format!(
@@ -1338,7 +1341,9 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            let escaped = escape_sql_string_literal(&btree.to_sql_as(&mangled_table_name));
+            let escaped = escape_sql_string_literal(
+                &btree.to_sql_as(&resolver.mangle_name(namespace, &btree.original_name)),
+            );
             let escaped_table_name = escape_sql_string_literal(&mangled_table_name);
             let stmt = format!(
                 r#"
@@ -1592,9 +1597,8 @@ pub fn translate_alter_table(
                 program.emit_string8_new_reg(mangled_table_name.clone());
                 program.mark_last_insn_constant();
 
-                program.emit_string8_new_reg(
-                    resolver.mangle_name(namespace, &normalize_ident(new_name)),
-                );
+                // The row gets the new name as written, as in SQLite.
+                program.emit_string8_new_reg(resolver.mangle_name(namespace, new_name));
                 program.mark_last_insn_constant();
 
                 let out = program.alloc_registers(5);
@@ -1646,7 +1650,7 @@ pub fn translate_alter_table(
                 connection,
                 database_id,
                 &mangled_table_name,
-                &mangled_new_name,
+                &resolver.mangle_name(namespace, new_name),
             );
 
             // For AUTOINCREMENT tables, also rewrite the persistent

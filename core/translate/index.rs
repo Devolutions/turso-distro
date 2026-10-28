@@ -253,7 +253,7 @@ pub fn translate_create_index(
         }
     }
     let idx = Arc::new(Index {
-        name: idx_name.clone(),
+        name: idx_name,
         table_name: tbl.name.clone(),
         root_page: 0, //  we dont have access till its created, after we parse the schema table
         columns,
@@ -321,8 +321,8 @@ pub fn translate_create_index(
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
-        &resolver.mangle_name(namespace, &idx_name),
-        &resolver.mangle_name(namespace, &tbl_name),
+        &resolver.mangle_name(namespace, original_idx_name.name.as_str()),
+        &resolver.mangle_name(namespace, &tbl.original_name),
         root_page_reg,
         Some(sql),
     )?;
@@ -346,7 +346,9 @@ pub fn translate_create_index(
         p5: 0,
     });
     // Parse the schema table to get the index root page and add new index to Schema
-    let escaped_idx_name = escape_sql_string_literal(&resolver.mangle_name(namespace, &idx_name));
+    let escaped_idx_name = escape_sql_string_literal(
+        &resolver.mangle_name(namespace, original_idx_name.name.as_str()),
+    );
     let parse_schema_where_clause = format!("name = '{escaped_idx_name}' AND type = 'index'");
     program.emit_insn(Insn::ParseSchema {
         db: database_id,

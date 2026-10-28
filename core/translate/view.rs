@@ -426,7 +426,8 @@ pub fn translate_create_view(
     if resolver.catalog.dialect.binds_names_at_create() {
         bind_sequence_names_in_select(&mut select_stmt, resolver)?;
     }
-    let stored_view_name = resolver.mangle_name(namespace, &normalized_view_name);
+    // Like SQLite, the row keeps the view name as written.
+    let stored_view_name = resolver.mangle_name(namespace, view_name.name.as_str());
     let sql = create_view_to_str(
         "VIEW",
         &resolver.name_in_sql(namespace, &view_name.name).as_ident(),
@@ -689,12 +690,13 @@ pub fn translate_drop_view(
         flags: CmpInsFlags::default(),
         collation: CollationSeq::for_internal_values(),
     });
+    // View rows keep the name as written, so compare it case-insensitively.
     program.emit_insn(Insn::Ne {
         lhs: col1_reg,
         rhs: view_name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
+        collation: CollationSeq::NoCase,
     });
     // Matches view - delete it
     program.emit_insn(Insn::RowId {
