@@ -1742,6 +1742,11 @@ impl Database {
                         state.mvcc_bootstrap_conn = None;
                     }
 
+                    // Release the connection that loaded the schema. Callers may keep
+                    // this state for the database's lifetime (the SDK kit does), and a
+                    // live connection here keeps `n_connections` above zero, so closing
+                    // the last user connection never ran its WAL checkpoint.
+                    state.conn = None;
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(
                         state
