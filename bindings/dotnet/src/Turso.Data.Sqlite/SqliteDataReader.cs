@@ -26,6 +26,7 @@ public class SqliteDataReader : DbDataReader
     private bool _isClosed;
     private bool _hasCurrentRow;
     private bool _hasPrefetchedRow;
+    private bool _currentStatementStepped;
     private bool _hadResultSet;
     private bool _currentStatementRowsAffectedCounted;
     private int _managedResultIndex;
@@ -35,6 +36,10 @@ public class SqliteDataReader : DbDataReader
     // native code for them on every cell.
     private TursoStatementHandle? _declaredTypeStatement;
     private string?[] _declaredTypeNames = [];
+
+    // Storage class each column last had in the current result set, so a NULL cell reports
+    // the type earlier rows had, as in Microsoft.Data.Sqlite.
+    private TursoValueType[] _fieldValueTypes = [];
 
     internal SqliteDataReader(SqliteCommand command, TursoStatementHandle statement, string currentSql, List<string> remainingSql, int recordsAffected, CommandBehavior behavior, Action closeCallback)
     {
@@ -332,8 +337,13 @@ public class SqliteDataReader : DbDataReader
         {
             ValidateOrdinal(ordinal);
             var column = CurrentManagedResult.Columns[ordinal];
-            if (IsGuidType(column.DataTypeName))
+            // GetValue turns GUID values in a GUID column into Guid and returns anything else as stored.
+            if (IsGuidType(column.DataTypeName)
+                && GetFirstManagedNonNullValue(ordinal) is var first
+                && (first is null || TryToGuid(first, out _)))
+            {
                 return typeof(Guid);
+            }
             if (column.FieldType != typeof(object))
                 return column.FieldType;
 
@@ -351,12 +361,55 @@ public class SqliteDataReader : DbDataReader
 
         var statement = GetStatement();
         ValidateOrdinal(ordinal);
-        var valueType = TursoBindings.GetValue(statement, ordinal).ValueType;
         var declaredType = GetDeclaredTypeName(ordinal);
+        var isGuidColumn = IsGuidType(declaredType);
+
+        // Like Microsoft.Data.Sqlite: the storage class of the value at hand (the first row's
+        // before Read), then the one an earlier row had, and only then the declared type. A
+        // `bit` column holding 0 is therefore Int64, not String. In a GUID column, values that
+        // GetValue turns into Guid report Guid.
+        PrefetchFirstRow();
+        var current = _hasCurrentRow || _hasPrefetchedRow
+            ? TursoBindings.GetValue(statement, ordinal)
+            : default;
+        var valueType = current.ValueType;
+        if (valueType is not (TursoValueType.Null or TursoValueType.Empty))
+        {
+            if (isGuidColumn && TryToGuid(current, out _))
+                return typeof(Guid);
+
+            _fieldValueTypes[ordinal] = valueType;
+            return GetClrTypeFromValueType(valueType);
+        }
+
+        valueType = _fieldValueTypes[ordinal];
+        if (valueType is not (TursoValueType.Null or TursoValueType.Empty))
+            return GetClrTypeFromValueType(valueType);
+        if (isGuidColumn)
+            return typeof(Guid);
+
         if (!string.IsNullOrEmpty(declaredType))
             return GetClrTypeFromSqliteType(declaredType, valueType);
 
         return GetClrTypeFromSqliteType(GetDataTypeName(ordinal), valueType);
+    }
+
+    // Steps the first row before Read when a caller needs its values early, as
+    // Microsoft.Data.Sqlite does; Read then returns that row.
+    private void PrefetchFirstRow()
+    {
+        if (_statement is null || _currentStatementStepped)
+            return;
+
+        _currentStatementStepped = true;
+        try
+        {
+            _hasPrefetchedRow = TursoBindings.Read(_statement);
+        }
+        catch (TursoException ex)
+        {
+            throw SqliteCommand.ToSqliteException(ex);
+        }
     }
 
     public override T GetFieldValue<T>(int ordinal)
@@ -579,8 +632,8 @@ public class SqliteDataReader : DbDataReader
             SchemaColumnInfo? columnInfo = null;
             var hasBaseColumn = baseColumnName is not null && tableName is not null && tableColumns.TryGetValue(baseColumnName, out columnInfo);
             var valueType = TursoBindings.GetValue(statement, i).ValueType;
-            if (valueType is TursoValueType.Empty or TursoValueType.Null)
-                valueType = GetSampleValueType(i);
+            var hasValue = valueType is not (TursoValueType.Empty or TursoValueType.Null)
+                           || TryGetSampleValueType(i, out valueType);
 
             var info = hasBaseColumn
                 ? columnInfo ?? throw new InvalidOperationException(Properties.Resources.NoData)
@@ -588,9 +641,14 @@ public class SqliteDataReader : DbDataReader
             var dataTypeName = info is not null
                 ? StripTypeLength(info.TypeName)
                 : GetDataTypeNameFromValueType(valueType, selection);
-            var dataType = info is not null
-                ? GetClrTypeFromSqliteType(info.TypeName, valueType)
-                : GetClrTypeFromValueType(valueType);
+            // Matches GetFieldType: a stored value's class wins over the declared type.
+            var dataType = info is null
+                ? GetClrTypeFromValueType(valueType)
+                : IsGuidType(info.TypeName)
+                    ? GetFieldType(i)
+                    : hasValue
+                        ? GetClrTypeFromValueType(valueType)
+                        : GetClrTypeFromSqliteType(info.TypeName, valueType);
             var isExpression = info is null;
             var row = schema.NewRow();
             row[SchemaTableColumn.ColumnName] = columnName;
@@ -681,8 +739,10 @@ public class SqliteDataReader : DbDataReader
         EnsureHasCurrentRow();
         var statement = GetStatement();
         var value = TursoBindings.GetValue(statement, ordinal);
-        if (IsGuidType(GetDeclaredTypeName(ordinal)) && value.ValueType is TursoValueType.Blob or TursoValueType.Text)
-            return ToGuid(value);
+        // GUID columns read as Guid, like System.Data.SQLite; a value that is not a GUID
+        // ('user-1') comes back as stored, as Microsoft.Data.Sqlite returns it.
+        if (IsGuidType(GetDeclaredTypeName(ordinal)) && TryToGuid(value, out var guid))
+            return guid;
 
         return value.ValueType switch
         {
@@ -778,6 +838,7 @@ public class SqliteDataReader : DbDataReader
                     _currentSql = rewrittenSql;
                     _hadResultSet = true;
                     _currentStatementRowsAffectedCounted = false;
+                    _currentStatementStepped = true;
                     _hasPrefetchedRow = TursoBindings.Read(statement);
                     return true;
                 }
@@ -831,6 +892,7 @@ public class SqliteDataReader : DbDataReader
 
         try
         {
+            _currentStatementStepped = true;
             _hasCurrentRow = TursoBindings.Read(_statement);
             if (!_hasCurrentRow)
                 CountCurrentStatementRowsAffected();
@@ -1001,9 +1063,9 @@ public class SqliteDataReader : DbDataReader
         var value = CurrentManagedResult.Rows[_managedRowIndex][ordinal] ?? DBNull.Value;
         if (value != DBNull.Value
             && IsGuidType(CurrentManagedResult.Columns[ordinal].DataTypeName)
-            && value is string or byte[])
+            && TryToGuid(value, out var guid))
         {
-            return ToGuid(value);
+            return guid;
         }
 
         return value;
@@ -1124,7 +1186,9 @@ public class SqliteDataReader : DbDataReader
             return;
 
         _declaredTypeStatement = _statement;
-        _declaredTypeNames = _statement is null ? [] : new string?[TursoBindings.GetFieldCount(_statement)];
+        var fieldCount = _statement is null ? 0 : TursoBindings.GetFieldCount(_statement);
+        _declaredTypeNames = new string?[fieldCount];
+        _fieldValueTypes = new TursoValueType[fieldCount];
     }
 
     private string ResolveDeclaredTypeName(int ordinal)
@@ -1275,17 +1339,19 @@ public class SqliteDataReader : DbDataReader
             : null;
     }
 
-    private TursoValueType GetSampleValueType(int ordinal)
+    // Finds the first non-NULL value's storage class in the result; Blob when there is none.
+    private bool TryGetSampleValueType(int ordinal, out TursoValueType valueType)
     {
         using var statement = _command.PrepareSingleStatement(_currentSql);
         while (TursoBindings.Read(statement))
         {
-            var valueType = TursoBindings.GetValue(statement, ordinal).ValueType;
+            valueType = TursoBindings.GetValue(statement, ordinal).ValueType;
             if (valueType is not TursoValueType.Null and not TursoValueType.Empty)
-                return valueType;
+                return true;
         }
 
-        return TursoValueType.Blob;
+        valueType = TursoValueType.Blob;
+        return false;
     }
 
     private static string GetDataTypeNameFromValueType(TursoValueType valueType, string selection)
@@ -1433,6 +1499,44 @@ public class SqliteDataReader : DbDataReader
                 ? new Guid(value.BlobValue)
                 : Guid.Parse(Encoding.UTF8.GetString(value.BlobValue))
             : Guid.Parse(value.StringValue);
+
+    // A 16-byte blob or GUID text; GetGuid still throws for anything else.
+    private static bool TryToGuid(TursoValue value, out Guid guid)
+    {
+        switch (value.ValueType)
+        {
+            case TursoValueType.Blob when value.BlobValue.Length == 16:
+                guid = new Guid(value.BlobValue);
+                return true;
+            case TursoValueType.Blob:
+                return Guid.TryParse(Encoding.UTF8.GetString(value.BlobValue), out guid);
+            case TursoValueType.Text:
+                return Guid.TryParse(value.StringValue, out guid);
+            default:
+                guid = Guid.Empty;
+                return false;
+        }
+    }
+
+    private static bool TryToGuid(object value, out Guid guid)
+    {
+        switch (value)
+        {
+            case Guid existing:
+                guid = existing;
+                return true;
+            case byte[] { Length: 16 } bytes:
+                guid = new Guid(bytes);
+                return true;
+            case byte[] bytes:
+                return Guid.TryParse(Encoding.UTF8.GetString(bytes), out guid);
+            case string text:
+                return Guid.TryParse(text, out guid);
+            default:
+                guid = Guid.Empty;
+                return false;
+        }
+    }
 
     private static Guid ToGuid(object value)
     {
