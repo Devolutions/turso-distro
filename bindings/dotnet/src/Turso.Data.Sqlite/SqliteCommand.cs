@@ -2,7 +2,6 @@ using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
-using System.Text;
 using System.Text.RegularExpressions;
 using Turso.Raw.Public;
 using Turso.Raw.Public.Handles;
@@ -854,71 +853,14 @@ public class SqliteCommand : DbCommand
             @"\)(?:\s|--[^\r\n]*(?:\r?\n|$)|/\*[\s\S]*?\*/)*(INSERT|UPDATE|DELETE|REPLACE)\b",
             RegexOptions.IgnoreCase | RegexOptions.Singleline);
 
+    // Local commands split with the same parser as managed ones, so a CREATE TRIGGER body
+    // (BEGIN ... END, with nested CASE ... END) stays one statement, and ';' inside block
+    // comments or '', "", [] and `` quotes never ends one.
     private static List<string> SplitStatements(string commandText)
-    {
-        var statements = new List<string>();
-        var current = new StringBuilder();
-        var inSingleQuote = false;
-        var inDoubleQuote = false;
-        var inLineComment = false;
-
-        for (var i = 0; i < commandText.Length; i++)
-        {
-            var c = commandText[i];
-            var next = i + 1 < commandText.Length ? commandText[i + 1] : '\0';
-
-            if (inLineComment)
-            {
-                current.Append(c);
-                if (c == '\n')
-                    inLineComment = false;
-                continue;
-            }
-
-            if (!inSingleQuote && !inDoubleQuote && c == '-' && next == '-')
-            {
-                inLineComment = true;
-                current.Append(c);
-                continue;
-            }
-
-            if (c == '\'' && !inDoubleQuote)
-            {
-                current.Append(c);
-                if (inSingleQuote && next == '\'')
-                {
-                    current.Append(next);
-                    i++;
-                    continue;
-                }
-
-                inSingleQuote = !inSingleQuote;
-                continue;
-            }
-
-            if (c == '"' && !inSingleQuote)
-                inDoubleQuote = !inDoubleQuote;
-
-            if (c == ';' && !inSingleQuote && !inDoubleQuote)
-            {
-                AddStatement(statements, current);
-                current.Clear();
-                continue;
-            }
-
-            current.Append(c);
-        }
-
-        AddStatement(statements, current);
-        return statements;
-    }
-
-    private static void AddStatement(List<string> statements, StringBuilder current)
-    {
-        var statement = current.ToString().Trim();
-        if (statement.Length != 0 && !IsEmptyCommand(statement))
-            statements.Add(statement);
-    }
+        => ManagedSqliteStatementParser.Parse(commandText)
+            .Select(statement => statement.Sql)
+            .Where(statement => !IsEmptyCommand(statement))
+            .ToList();
 
     internal static SqliteException ToSqliteException(TursoException ex, string? sql = null)
     {
