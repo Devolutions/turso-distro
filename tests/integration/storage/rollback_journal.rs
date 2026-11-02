@@ -547,6 +547,33 @@ async fn test_builder_rollback_journal() {
     );
 }
 
+/// Without the autovacuum flag, an auto-vacuum database opens read-only, so
+/// its header must not be switched to WAL either.
+#[test]
+fn test_auto_vacuum_database_opened_read_only_keeps_its_journal_mode() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("autovacuum.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "PRAGMA auto_vacuum = FULL; PRAGMA journal_mode = DELETE; \
+         CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT); INSERT INTO t(b) VALUES ('from sqlite');",
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(header_versions(&path), (1, 1));
+
+    let db = open_in_turso(&path, false);
+    assert!(db.is_readonly());
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(turso_texts(&conn, "SELECT count(*) FROM t"), rows(&["1"]));
+    conn.close().unwrap();
+    drop(conn);
+    drop(db);
+
+    assert_eq!(header_versions(&path), (1, 1));
+    assert!(!wal_path(&path).exists());
+}
+
 /// VACUUM rewrites the file under EXCLUSIVE, and a SQLite connection that
 /// cached pages before sees the new file.
 #[test]
