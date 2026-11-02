@@ -70,6 +70,8 @@ static PENDING_BYTE: AtomicU32 = AtomicU32::new(0x40000000);
 const PENDING_BYTE: u32 = 0x40000000;
 
 #[cfg(feature = "autovacuum")]
+mod autovacuum;
+#[cfg(feature = "autovacuum")]
 use ptrmap::*;
 
 #[derive(Debug, Clone)]
@@ -1318,6 +1320,21 @@ enum CheckpointPhase {
     Finalize { clear_page_cache: bool },
 }
 
+/// What a newly allocated page is for. Auto-vacuum databases record it in
+/// the pointer map.
+#[derive(Debug, Clone, Copy)]
+pub enum NewPageKind {
+    BTree,
+    /// The first overflow page of a cell on b-tree page `cell_page`.
+    FirstOverflow {
+        cell_page: u32,
+    },
+    /// The overflow page that follows overflow page `previous`.
+    NextOverflow {
+        previous: u32,
+    },
+}
+
 /// The mode of allocating a btree page.
 /// SQLite defines the following:
 /// #define BTALLOC_ANY   0           /* Allocate any page */
@@ -1416,40 +1433,12 @@ const fn auto_vacuum_header_fields(mode: AutoVacuumMode) -> (u32, u32) {
 }
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "autovacuum")]
-enum PtrMapGetState {
-    Start,
-    Deserialize {
-        ptrmap_page: PageRef,
-        offset_in_ptrmap_page: usize,
-    },
-}
-
-#[derive(Debug, Clone)]
-#[cfg(feature = "autovacuum")]
-enum PtrMapPutState {
-    Start,
-    Deserialize {
-        ptrmap_page: PageRef,
-        offset_in_ptrmap_page: usize,
-    },
-}
-
-#[derive(Debug, Clone)]
 enum HeaderRefState {
     Start,
     CreateHeader {
         page: PageRef,
         completion: Option<Completion>,
     },
-}
-
-#[cfg(feature = "autovacuum")]
-#[derive(Debug, Clone, Copy)]
-enum BtreeCreateVacuumFullState {
-    Start,
-    AllocatePage { root_page_num: u32 },
-    PtrMapPut { allocated_page_id: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -1794,11 +1783,7 @@ impl SpillYieldHook {
 
 #[cfg(feature = "autovacuum")]
 pub struct VacuumState {
-    /// State machine for [Pager::ptrmap_get]
-    ptrmap_get_state: PtrMapGetState,
-    /// State machine for [Pager::ptrmap_put]
-    ptrmap_put_state: PtrMapPutState,
-    btree_create_vacuum_full_state: BtreeCreateVacuumFullState,
+    auto_vacuum: autovacuum::AutoVacuumState,
 }
 
 #[derive(Debug, Clone)]
@@ -1822,6 +1807,12 @@ enum AllocatePageState {
     AllocateNewPage {
         current_db_size: u32,
     },
+    /// In an auto-vacuum database, record what the allocated page is for in
+    /// the pointer map.
+    #[cfg(feature = "autovacuum")]
+    RecordInPtrmap {
+        page: PageRef,
+    },
 }
 
 #[derive(Clone)]
@@ -1841,8 +1832,15 @@ enum AllocatePage1State {
 #[derive(Debug, Clone)]
 enum FreePageState {
     Start,
-    AddToTrunk { page: Arc<Page> },
-    NewTrunk { page: Arc<Page> },
+    AddToTrunk {
+        page: Arc<Page>,
+    },
+    NewTrunk {
+        page: Arc<Page>,
+    },
+    /// In an auto-vacuum database, mark the page free in the pointer map.
+    #[cfg(feature = "autovacuum")]
+    RecordInPtrmap,
 }
 
 /// State machine for async cache spilling.
@@ -1969,9 +1967,7 @@ impl Pager {
             header_ref_state: RwLock::new(HeaderRefState::Start),
             #[cfg(feature = "autovacuum")]
             vacuum_state: RwLock::new(VacuumState {
-                ptrmap_get_state: PtrMapGetState::Start,
-                ptrmap_put_state: PtrMapPutState::Start,
-                btree_create_vacuum_full_state: BtreeCreateVacuumFullState::Start,
+                auto_vacuum: autovacuum::AutoVacuumState::new(),
             }),
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
@@ -2721,196 +2717,6 @@ impl Pager {
         Ok(())
     }
 
-    /// Retrieves the pointer map entry for a given database page.
-    /// `target_page_num` (1-indexed) is the page whose entry is sought.
-    /// Returns `Ok(None)` if the page is not supposed to have a ptrmap entry (e.g. header, or a ptrmap page itself).
-    #[cfg(feature = "autovacuum")]
-    pub fn ptrmap_get(&self, target_page_num: u32) -> IOResultOr<Option<PtrmapEntry>> {
-        loop {
-            let ptrmap_get_state = {
-                let vacuum_state = self.vacuum_state.read();
-                vacuum_state.ptrmap_get_state.clone()
-            };
-            match ptrmap_get_state {
-                PtrMapGetState::Start => {
-                    tracing::trace!("ptrmap_get(page_idx = {})", target_page_num);
-                    let configured_page_size =
-                        return_if_io!(self.with_header(|header| header.page_size)).get() as usize;
-
-                    if target_page_num < FIRST_PTRMAP_PAGE_NO
-                        || is_ptrmap_page(target_page_num, configured_page_size)
-                    {
-                        return Ok(IOResult::Done(None));
-                    }
-
-                    let ptrmap_pg_no =
-                        get_ptrmap_page_no_for_db_page(target_page_num, configured_page_size);
-                    let offset_in_ptrmap_page = get_ptrmap_offset_in_page(
-                        target_page_num,
-                        ptrmap_pg_no,
-                        configured_page_size,
-                    )?;
-                    tracing::trace!(
-                        "ptrmap_get(page_idx = {}) = ptrmap_pg_no = {}",
-                        target_page_num,
-                        ptrmap_pg_no
-                    );
-
-                    // `return_if_io!` keeps `ptrmap_get_state` at `Start` on
-                    // spill so re-entry resumes via pending-read tracking.
-                    let (ptrmap_page, c) = return_if_io!(self.read_page(ptrmap_pg_no as i64));
-                    self.vacuum_state.write().ptrmap_get_state = PtrMapGetState::Deserialize {
-                        ptrmap_page,
-                        offset_in_ptrmap_page,
-                    };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                PtrMapGetState::Deserialize {
-                    ptrmap_page,
-                    offset_in_ptrmap_page,
-                } => {
-                    turso_assert!(ptrmap_page.is_loaded(), "ptrmap_page should be loaded");
-                    let page_content = ptrmap_page.get_contents();
-                    let ptrmap_pg_no = page_content.id();
-
-                    let full_buffer_slice: &[u8] = page_content.as_ptr();
-
-                    // Ptrmap pages are not page 1, so their internal offset within their buffer should be 0.
-                    // The actual page data starts at page_content.offset() within the full_buffer_slice.
-                    if ptrmap_pg_no != 1 && page_content.offset() != 0 {
-                        return Err(LimboError::Corrupt(format!(
-                            "Ptrmap page {} has unexpected internal offset {}",
-                            ptrmap_pg_no,
-                            page_content.offset()
-                        ))
-                        .into());
-                    }
-                    let ptrmap_page_data_slice: &[u8] = &full_buffer_slice[page_content.offset()..];
-                    let actual_data_length = ptrmap_page_data_slice.len();
-
-                    // Check if the calculated offset for the entry is within the bounds of the actual page data length.
-                    if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > actual_data_length {
-                        return Err(LimboError::InternalError(format!(
-                        "Ptrmap offset {offset_in_ptrmap_page} + entry size {PTRMAP_ENTRY_SIZE} out of bounds for page {ptrmap_pg_no} (actual data len {actual_data_length})"
-                    )).into());
-                    }
-
-                    let entry_slice = &ptrmap_page_data_slice
-                        [offset_in_ptrmap_page..offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE];
-                    self.vacuum_state.write().ptrmap_get_state = PtrMapGetState::Start;
-                    break match PtrmapEntry::deserialize(entry_slice) {
-                        Some(entry) => Ok(IOResult::Done(Some(entry))),
-                        None => Err(LimboError::Corrupt(format!(
-                            "Failed to deserialize ptrmap entry for page {target_page_num} from ptrmap page {ptrmap_pg_no}"
-                        )).into()),
-                    };
-                }
-            }
-        }
-    }
-
-    /// Writes or updates the pointer map entry for a given database page.
-    /// `db_page_no_to_update` (1-indexed) is the page whose entry is to be set.
-    /// `entry_type` and `parent_page_no` define the new entry.
-    #[cfg(feature = "autovacuum")]
-    pub fn ptrmap_put(
-        &self,
-        db_page_no_to_update: u32,
-        entry_type: PtrmapType,
-        parent_page_no: u32,
-    ) -> IOResultOr<()> {
-        tracing::trace!(
-            "ptrmap_put(page_idx = {}, entry_type = {:?}, parent_page_no = {})",
-            db_page_no_to_update,
-            entry_type,
-            parent_page_no
-        );
-        loop {
-            let ptrmap_put_state = {
-                let vacuum_state = self.vacuum_state.read();
-                vacuum_state.ptrmap_put_state.clone()
-            };
-            match ptrmap_put_state {
-                PtrMapPutState::Start => {
-                    let page_size =
-                        return_if_io!(self.with_header(|header| header.page_size)).get() as usize;
-
-                    if db_page_no_to_update < FIRST_PTRMAP_PAGE_NO
-                        || is_ptrmap_page(db_page_no_to_update, page_size)
-                    {
-                        turso_soft_unreachable!("Cannot set ptrmap entry for header/ptrmap page or invalid page", { "page": db_page_no_to_update });
-                        return Err(LimboError::InternalError(format!(
-                        "Cannot set ptrmap entry for page {db_page_no_to_update}: it's a header/ptrmap page or invalid."
-                    )).into());
-                    }
-
-                    let ptrmap_pg_no =
-                        get_ptrmap_page_no_for_db_page(db_page_no_to_update, page_size);
-                    let offset_in_ptrmap_page =
-                        get_ptrmap_offset_in_page(db_page_no_to_update, ptrmap_pg_no, page_size)?;
-                    tracing::trace!(
-                        "ptrmap_put(page_idx = {}, entry_type = {:?}, parent_page_no = {}) = ptrmap_pg_no = {}, offset_in_ptrmap_page = {}",
-                        db_page_no_to_update,
-                        entry_type,
-                        parent_page_no,
-                        ptrmap_pg_no,
-                        offset_in_ptrmap_page
-                    );
-
-                    // `return_if_io!` keeps `ptrmap_put_state` at `Start` on
-                    // spill so re-entry resumes via pending-read tracking.
-                    let (ptrmap_page, c) = return_if_io!(self.read_page(ptrmap_pg_no as i64));
-                    self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Deserialize {
-                        ptrmap_page,
-                        offset_in_ptrmap_page,
-                    };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                PtrMapPutState::Deserialize {
-                    ptrmap_page,
-                    offset_in_ptrmap_page,
-                } => {
-                    turso_assert!(ptrmap_page.is_loaded(), "page should be loaded");
-                    self.add_dirty(&ptrmap_page)?;
-                    let page_content = ptrmap_page.get_contents();
-                    let ptrmap_pg_no = page_content.id();
-
-                    let full_buffer_slice = page_content.as_ptr();
-
-                    if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > full_buffer_slice.len() {
-                        return Err(LimboError::InternalError(format!(
-                        "Ptrmap offset {} + entry size {} out of bounds for page {} (actual data len {})",
-                        offset_in_ptrmap_page,
-                        PTRMAP_ENTRY_SIZE,
-                        ptrmap_pg_no,
-                        full_buffer_slice.len()
-                    )).into());
-                    }
-
-                    let entry = PtrmapEntry {
-                        entry_type,
-                        parent_page_no,
-                    };
-                    entry.serialize(
-                        &mut full_buffer_slice
-                            [offset_in_ptrmap_page..offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE],
-                    )?;
-
-                    turso_assert!(
-                        ptrmap_page.get().id() == ptrmap_pg_no,
-                        "ptrmap page has unexpected number"
-                    );
-                    self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Start;
-                    break Ok(IOResult::Done(()));
-                }
-            }
-        }
-    }
-
     /// This method is used to allocate a new root page for a btree, both for tables and indexes
     /// FIXME: handle no room in page cache
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2926,112 +2732,23 @@ impl Pager {
             Ok(IOResult::Done(page.get().id() as u32))
         }
 
-        //  If autovacuum is enabled, we need to allocate a new page number that is greater than the largest root page number
         #[cfg(feature = "autovacuum")]
         {
-            let auto_vacuum_mode =
-                AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst));
-            match auto_vacuum_mode {
-                AutoVacuumMode::None => {
-                    let page =
-                        return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
-                    Ok(IOResult::Done(page.get().id() as u32))
-                }
-                AutoVacuumMode::Full => {
-                    loop {
-                        let btree_create_vacuum_full_state = {
-                            let vacuum_state = self.vacuum_state.read();
-                            vacuum_state.btree_create_vacuum_full_state
-                        };
-                        match btree_create_vacuum_full_state {
-                            BtreeCreateVacuumFullState::Start => {
-                                let (mut root_page_num, page_size) = return_if_io!(self
-                                    .with_header(|header| {
-                                        (
-                                            header.vacuum_mode_largest_root_page.get(),
-                                            header.page_size.get(),
-                                        )
-                                    }));
-
-                                turso_assert_greater_than!(root_page_num, 0, "Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled");
-                                root_page_num += 1;
-                                turso_assert_greater_than_or_equal!(
-                                    root_page_num,
-                                    FIRST_PTRMAP_PAGE_NO,
-                                    "can never be less than 2 because we have already incremented"
-                                );
-
-                                while is_ptrmap_page(root_page_num, page_size as usize) {
-                                    root_page_num += 1;
-                                }
-                                turso_assert_greater_than_or_equal!(
-                                    root_page_num,
-                                    3,
-                                    "root page must be >= 3 (number of the first root page)"
-                                );
-                                self.vacuum_state.write().btree_create_vacuum_full_state =
-                                    BtreeCreateVacuumFullState::AllocatePage { root_page_num };
-                            }
-                            BtreeCreateVacuumFullState::AllocatePage { root_page_num } => {
-                                //  root_page_num here is the desired root page
-                                let page = return_if_io!(self.do_allocate_page(
-                                    page_type,
-                                    0,
-                                    BtreePageAllocMode::Exact(root_page_num),
-                                ));
-                                let allocated_page_id = page.get().id() as u32;
-
-                                return_if_io!(self.with_header_mut(|header| {
-                                    if allocated_page_id
-                                        > header.vacuum_mode_largest_root_page.get()
-                                    {
-                                        tracing::debug!(
-                                            "Updating largest root page in header from {} to {}",
-                                            header.vacuum_mode_largest_root_page.get(),
-                                            allocated_page_id
-                                        );
-                                        header.vacuum_mode_largest_root_page =
-                                            allocated_page_id.into();
-                                    }
-                                }));
-
-                                if allocated_page_id != root_page_num {
-                                    //  TODO(Zaid): Handle swapping the allocated page with the desired root page
-                                }
-
-                                //  TODO(Zaid): Update the header metadata to reflect the new root page number
-                                self.vacuum_state.write().btree_create_vacuum_full_state =
-                                    BtreeCreateVacuumFullState::PtrMapPut { allocated_page_id };
-                            }
-                            BtreeCreateVacuumFullState::PtrMapPut { allocated_page_id } => {
-                                //  For now map allocated_page_id since we are not swapping it with root_page_num
-                                return_if_io!(self.ptrmap_put(
-                                    allocated_page_id,
-                                    PtrmapType::RootPage,
-                                    0,
-                                ));
-                                self.vacuum_state.write().btree_create_vacuum_full_state =
-                                    BtreeCreateVacuumFullState::Start;
-                                return Ok(IOResult::Done(allocated_page_id));
-                            }
-                        }
-                    }
-                }
-                AutoVacuumMode::Incremental => {
-                    return Err(LimboError::InternalError(
-                        "Incremental auto-vacuum is not supported".to_string(),
-                    )
-                    .into());
-                }
+            let mode = return_if_io!(self.with_header(autovacuum::auto_vacuum_mode_of));
+            if mode == AutoVacuumMode::None {
+                let page =
+                    return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
+                return Ok(IOResult::Done(page.get().id() as u32));
             }
+            self.create_root_page(page_type)
         }
     }
 
     /// Allocate a new overflow page.
     /// This is done when a cell overflows and new space is needed.
     // FIXME: handle no room in page cache
-    pub fn allocate_overflow_page(&self) -> IOResultOr<PageRef> {
-        let page = return_if_io!(self.allocate_page());
+    pub fn allocate_overflow_page(&self, kind: NewPageKind) -> IOResultOr<PageRef> {
+        let page = return_if_io!(self.allocate_page_for(kind));
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id());
 
         // setup overflow page
@@ -3454,6 +3171,10 @@ impl Pager {
                     return Ok(IOResult::Done(()));
                 }
                 _ => {
+                    #[cfg(feature = "autovacuum")]
+                    if self.commit_info.read().state == CommitState::PrepareWal {
+                        return_if_io!(self.auto_vacuum_commit());
+                    }
                     return_if_io!(self.commit_wal(
                         connection.wal_auto_actions(),
                         connection.get_wal_autocheckpoint(),
@@ -5650,6 +5371,11 @@ impl Pager {
 
                         // Unpin page before finishing - it's added to freelist
                         page.unpin();
+                        #[cfg(feature = "autovacuum")]
+                        if autovacuum::auto_vacuum_mode_of(header) != AutoVacuumMode::None {
+                            *state = FreePageState::RecordInPtrmap;
+                            continue;
+                        }
                         break;
                     }
                     // page remains pinned as it transitions to NewTrunk state
@@ -5673,6 +5399,16 @@ impl Pager {
                     header.freelist_trunk_page = (page_id as u32).into();
                     // Unpin page before finishing - it's now a trunk page
                     page.unpin();
+                    #[cfg(feature = "autovacuum")]
+                    if autovacuum::auto_vacuum_mode_of(header) != AutoVacuumMode::None {
+                        *state = FreePageState::RecordInPtrmap;
+                        continue;
+                    }
+                    break;
+                }
+                #[cfg(feature = "autovacuum")]
+                FreePageState::RecordInPtrmap => {
+                    return_if_io!(self.ptrmap_put(page_id as u32, PtrmapType::FreePage, 0));
                     break;
                 }
             }
@@ -5809,6 +5545,12 @@ impl Pager {
     #[allow(clippy::readonly_write_lock)]
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn allocate_page(&self) -> IOResultOr<PageRef> {
+        self.allocate_page_for(NewPageKind::BTree)
+    }
+
+    fn allocate_page_for(&self, kind: NewPageKind) -> IOResultOr<PageRef> {
+        #[cfg(not(feature = "autovacuum"))]
+        let _ = kind;
         // Ensure cache has room before allocating (we may spill dirty pages first)
         return_if_io!(self.ensure_cache_space());
 
@@ -5912,6 +5654,11 @@ impl Pager {
                     // Unpin trunk_page before returning - caller takes ownership
                     trunk_page.unpin();
                     let trunk_page = trunk_page.clone();
+                    #[cfg(feature = "autovacuum")]
+                    if autovacuum::auto_vacuum_mode_of(header) != AutoVacuumMode::None {
+                        *state = AllocatePageState::RecordInPtrmap { page: trunk_page };
+                        continue;
+                    }
                     *state = AllocatePageState::Start;
                     return Ok(IOResult::Done(trunk_page));
                 }
@@ -5972,6 +5719,11 @@ impl Pager {
                     trunk_page.unpin();
                     leaf_page.unpin();
                     let leaf_page = leaf_page.clone();
+                    #[cfg(feature = "autovacuum")]
+                    if autovacuum::auto_vacuum_mode_of(header) != AutoVacuumMode::None {
+                        *state = AllocatePageState::RecordInPtrmap { page: leaf_page };
+                        continue;
+                    }
                     *state = AllocatePageState::Start;
                     return Ok(IOResult::Done(leaf_page));
                 }
@@ -5984,10 +5736,8 @@ impl Pager {
                     #[cfg(feature = "autovacuum")]
                     let mut ptrmap_page_id = None;
                     #[cfg(feature = "autovacuum")]
-                    if matches!(
-                        AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst)),
-                        AutoVacuumMode::Full
-                    ) && is_ptrmap_page(new_db_size, header.page_size.get() as usize)
+                    if autovacuum::auto_vacuum_mode_of(header) != AutoVacuumMode::None
+                        && self.ptrmap_geometry().is_ptrmap_page(new_db_size)
                     {
                         ptrmap_page_id = Some(new_db_size);
                         new_db_size += 1;
@@ -6036,9 +5786,29 @@ impl Pager {
                             .write()
                             .force_insert_page(page_key, page.clone())?;
                         header.database_size = new_db_size.into();
+                        #[cfg(feature = "autovacuum")]
+                        if autovacuum::auto_vacuum_mode_of(header) != AutoVacuumMode::None {
+                            *state = AllocatePageState::RecordInPtrmap { page };
+                            continue;
+                        }
                         *state = AllocatePageState::Start;
                         return Ok(IOResult::Done(page));
                     }
+                }
+                #[cfg(feature = "autovacuum")]
+                AllocatePageState::RecordInPtrmap { page } => {
+                    let (entry_type, parent) = match kind {
+                        NewPageKind::BTree => (PtrmapType::BTreeNode, 0),
+                        NewPageKind::FirstOverflow { cell_page } => {
+                            (PtrmapType::Overflow1, cell_page)
+                        }
+                        NewPageKind::NextOverflow { previous } => (PtrmapType::Overflow2, previous),
+                    };
+                    let page_id = page.get().id() as u32;
+                    return_if_io!(self.ptrmap_put(page_id, entry_type, parent));
+                    let page = page.clone();
+                    *state = AllocatePageState::Start;
+                    return Ok(IOResult::Done(page));
                 }
             }
         }
@@ -6139,12 +5909,7 @@ impl Pager {
         *self.free_page_state.write() = FreePageState::Start;
         *self.spill_state.write() = SpillState::Idle;
         #[cfg(feature = "autovacuum")]
-        {
-            let mut vacuum_state = self.vacuum_state.write();
-            vacuum_state.ptrmap_get_state = PtrMapGetState::Start;
-            vacuum_state.ptrmap_put_state = PtrMapPutState::Start;
-            vacuum_state.btree_create_vacuum_full_state = BtreeCreateVacuumFullState::Start;
-        }
+        self.reset_auto_vacuum_state();
 
         *self.header_ref_state.write() = HeaderRefState::Start;
     }
@@ -6386,9 +6151,10 @@ impl CreateBTreeFlags {
 */
 #[cfg(feature = "autovacuum")]
 pub(crate) mod ptrmap {
-    #[allow(unused_imports)]
-    use crate::{storage::sqlite3_ondisk::PageSize, LimboError, Result};
-    use crate::{turso_assert_greater_than_or_equal, turso_soft_unreachable};
+    use crate::{
+        turso_assert_greater_than, turso_assert_greater_than_or_equal, turso_soft_unreachable,
+    };
+    use crate::{LimboError, Result};
 
     // Constants
     pub const PTRMAP_ENTRY_SIZE: usize = 5;
@@ -6453,80 +6219,95 @@ pub(crate) mod ptrmap {
         }
     }
 
-    /// Calculates how many database pages are mapped by a single pointer map page.
-    /// This is based on the total page size, as ptrmap pages are filled with entries.
-    pub fn entries_per_ptrmap_page(page_size: usize) -> usize {
-        turso_assert_greater_than_or_equal!(page_size, PageSize::MIN as usize);
-        page_size / PTRMAP_ENTRY_SIZE
+    /// Where pointer-map pages sit in a file with a given usable page size,
+    /// as SQLite's `ptrmapPageno` and `PTRMAP_PTROFFSET` compute it.
+    #[derive(Debug, Clone, Copy)]
+    pub struct PtrmapGeometry {
+        usable_size: u32,
+        pending_byte_page: u32,
     }
 
-    /// Calculates the cycle length of pointer map pages
-    /// The cycle length is the number of database pages that are mapped by a single pointer map page.
-    pub fn ptrmap_page_cycle_length(page_size: usize) -> usize {
-        turso_assert_greater_than_or_equal!(page_size, PageSize::MIN as usize);
-        (page_size / PTRMAP_ENTRY_SIZE) + 1
-    }
-
-    /// Determines if a given page number `db_page_no` (1-indexed) is a pointer map page in a database with autovacuum enabled
-    pub fn is_ptrmap_page(db_page_no: u32, page_size: usize) -> bool {
-        //  The first page cannot be a ptrmap page because its for the schema
-        if db_page_no == 1 {
-            return false;
-        }
-        if db_page_no == FIRST_PTRMAP_PAGE_NO {
-            return true;
-        }
-        get_ptrmap_page_no_for_db_page(db_page_no, page_size) == db_page_no
-    }
-
-    /// Calculates which pointer map page (1-indexed) contains the entry for `db_page_no_to_query` (1-indexed).
-    /// `db_page_no_to_query` is the page whose ptrmap entry we are interested in.
-    pub fn get_ptrmap_page_no_for_db_page(db_page_no_to_query: u32, page_size: usize) -> u32 {
-        let group_size = ptrmap_page_cycle_length(page_size) as u32;
-        if group_size == 0 {
-            panic!("Page size too small, a ptrmap page cannot map any db pages.");
+    impl PtrmapGeometry {
+        /// `pending_byte_page` is 0 when the pending byte is past the largest page.
+        pub fn new(usable_size: u32, pending_byte_page: u32) -> Self {
+            turso_assert_greater_than_or_equal!(usable_size, 480);
+            Self {
+                usable_size,
+                pending_byte_page,
+            }
         }
 
-        let effective_page_index = db_page_no_to_query - FIRST_PTRMAP_PAGE_NO;
-        let group_idx = effective_page_index / group_size;
-
-        (group_idx * group_size) + FIRST_PTRMAP_PAGE_NO
-    }
-
-    /// Calculates the byte offset of the entry for `db_page_no_to_query` (1-indexed)
-    /// within its pointer map page (`ptrmap_page_no`, 1-indexed).
-    pub fn get_ptrmap_offset_in_page(
-        db_page_no_to_query: u32,
-        ptrmap_page_no: u32,
-        page_size: usize,
-    ) -> Result<usize> {
-        // The data pages mapped by `ptrmap_page_no` are:
-        // `ptrmap_page_no + 1`, `ptrmap_page_no + 2`, ..., up to `ptrmap_page_no + n_data_pages_per_group`.
-        // `db_page_no_to_query` must be one of these.
-        // The 0-indexed position of `db_page_no_to_query` within this sequence of data pages is:
-        // `db_page_no_to_query - (ptrmap_page_no + 1)`.
-
-        let n_data_pages_per_group = entries_per_ptrmap_page(page_size);
-        let first_data_page_mapped = ptrmap_page_no + 1;
-        let last_data_page_mapped = ptrmap_page_no + n_data_pages_per_group as u32;
-
-        if db_page_no_to_query < first_data_page_mapped
-            || db_page_no_to_query > last_data_page_mapped
-        {
-            turso_soft_unreachable!("Page is not mapped by ptrmap data range", { "page": db_page_no_to_query, "range_start": first_data_page_mapped, "range_end": last_data_page_mapped, "ptrmap_page": ptrmap_page_no });
-            return Err(LimboError::InternalError(format!(
-                "Page {db_page_no_to_query} is not mapped by the data page range [{first_data_page_mapped}, {last_data_page_mapped}] of ptrmap page {ptrmap_page_no}"
-            )));
-        }
-        if is_ptrmap_page(db_page_no_to_query, page_size) {
-            turso_soft_unreachable!("Page is a pointer map page and should not have an entry calculated this way", { "page": db_page_no_to_query });
-            return Err(LimboError::InternalError(format!(
-                "Page {db_page_no_to_query} is a pointer map page and should not have an entry calculated this way."
-            )));
+        pub fn entries_per_page(&self) -> u32 {
+            self.usable_size / PTRMAP_ENTRY_SIZE as u32
         }
 
-        let entry_index_on_page = (db_page_no_to_query - first_data_page_mapped) as usize;
-        Ok(entry_index_on_page * PTRMAP_ENTRY_SIZE)
+        /// The pointer-map page that holds the entry of `page_no`, or 0 for page 1.
+        pub fn ptrmap_page_no(&self, page_no: u32) -> u32 {
+            if page_no < FIRST_PTRMAP_PAGE_NO {
+                return 0;
+            }
+            let pages_per_map_page = self.entries_per_page() + 1;
+            let ptrmap_page_no = (page_no - FIRST_PTRMAP_PAGE_NO) / pages_per_map_page
+                * pages_per_map_page
+                + FIRST_PTRMAP_PAGE_NO;
+            if ptrmap_page_no == self.pending_byte_page {
+                ptrmap_page_no + 1
+            } else {
+                ptrmap_page_no
+            }
+        }
+
+        pub fn is_ptrmap_page(&self, page_no: u32) -> bool {
+            self.ptrmap_page_no(page_no) == page_no
+        }
+
+        /// Pages that are neither page 1 nor b-tree, overflow or free pages:
+        /// pointer-map pages and the pending-byte page.
+        pub fn is_unmapped_page(&self, page_no: u32) -> bool {
+            self.is_ptrmap_page(page_no) || page_no == self.pending_byte_page
+        }
+
+        pub fn check_has_entry(&self, page_no: u32) -> Result<()> {
+            if page_no < FIRST_PTRMAP_PAGE_NO || self.is_unmapped_page(page_no) {
+                turso_soft_unreachable!("Page has no pointer map entry", { "page": page_no });
+                return Err(LimboError::Corrupt(format!(
+                    "page {page_no} has no pointer map entry"
+                )));
+            }
+            Ok(())
+        }
+
+        /// Byte offset of the entry of `page_no` in its pointer-map page.
+        pub fn entry_offset(&self, page_no: u32) -> usize {
+            let ptrmap_page_no = self.ptrmap_page_no(page_no);
+            turso_assert_greater_than!(page_no, ptrmap_page_no, "page has no pointer map entry");
+            PTRMAP_ENTRY_SIZE * (page_no - ptrmap_page_no - 1) as usize
+        }
+
+        /// The number of pages left once the `free_pages` free pages and the
+        /// pointer-map pages that are no longer needed are removed from a file
+        /// of `page_count` pages (SQLite's `finalDbSize`).
+        pub fn final_db_size(&self, page_count: u32, free_pages: u32) -> u32 {
+            let entries = self.entries_per_page();
+            let ptrmap_pages = free_pages
+                .wrapping_sub(page_count)
+                .wrapping_add(self.ptrmap_page_no(page_count))
+                .wrapping_add(entries)
+                / entries;
+            let mut final_size = page_count
+                .wrapping_sub(free_pages)
+                .wrapping_sub(ptrmap_pages);
+            if page_count > self.pending_byte_page
+                && self.pending_byte_page != 0
+                && final_size < self.pending_byte_page
+            {
+                final_size -= 1;
+            }
+            while self.is_unmapped_page(final_size) {
+                final_size -= 1;
+            }
+            final_size
+        }
     }
 }
 
@@ -6931,7 +6712,7 @@ mod ptrmap_tests {
         // Page 5 should be mapped by ptrmap page 2.
         let db_page_to_update: u32 = 5;
         let expected_ptrmap_pg_no =
-            get_ptrmap_page_no_for_db_page(db_page_to_update, page_size as usize);
+            PtrmapGeometry::new(page_size, 0).ptrmap_page_no(db_page_to_update);
         assert_eq!(expected_ptrmap_pg_no, FIRST_PTRMAP_PAGE_NO);
 
         //  Ensure the pointer map page ref is created and loadable via the pager
@@ -6965,7 +6746,7 @@ mod ptrmap_tests {
         let page_size = 4096;
         // Pages 1..=821: header, ptrmap page 2 and 819 root pages. Page 822 is the next ptrmap page.
         let pager = test_pager_setup(page_size, 819);
-        assert!(is_ptrmap_page(822, page_size as usize));
+        assert!(PtrmapGeometry::new(page_size, 0).is_ptrmap_page(822));
         run_until_done(|| pager.free_page(None, 50), &pager).unwrap();
 
         let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
@@ -7009,69 +6790,90 @@ mod ptrmap_tests {
 
     #[test]
     fn test_is_ptrmap_page_logic() {
-        let page_size = PageSize::MIN as usize;
-        let n_data_pages = entries_per_ptrmap_page(page_size);
-        assert_eq!(n_data_pages, 102); //   512/5 = 102
+        let geometry = PtrmapGeometry::new(PageSize::MIN, 0);
+        assert_eq!(geometry.entries_per_page(), 102); //   512/5 = 102
 
-        assert!(!is_ptrmap_page(1, page_size)); // Header
-        assert!(is_ptrmap_page(2, page_size)); // P0
-        assert!(!is_ptrmap_page(3, page_size)); // D0_1
-        assert!(!is_ptrmap_page(4, page_size)); // D0_2
-        assert!(!is_ptrmap_page(5, page_size)); // D0_3
-        assert!(is_ptrmap_page(105, page_size)); // P1
-        assert!(!is_ptrmap_page(106, page_size)); // D1_1
-        assert!(!is_ptrmap_page(107, page_size)); // D1_2
-        assert!(!is_ptrmap_page(108, page_size)); // D1_3
-        assert!(is_ptrmap_page(208, page_size)); // P2
+        assert!(!geometry.is_ptrmap_page(1)); // Header
+        assert!(geometry.is_ptrmap_page(2)); // P0
+        assert!(!geometry.is_ptrmap_page(3)); // D0_1
+        assert!(!geometry.is_ptrmap_page(4)); // D0_2
+        assert!(!geometry.is_ptrmap_page(5)); // D0_3
+        assert!(geometry.is_ptrmap_page(105)); // P1
+        assert!(!geometry.is_ptrmap_page(106)); // D1_1
+        assert!(!geometry.is_ptrmap_page(107)); // D1_2
+        assert!(!geometry.is_ptrmap_page(108)); // D1_3
+        assert!(geometry.is_ptrmap_page(208)); // P2
     }
 
     #[test]
     fn test_get_ptrmap_page_no() {
-        let page_size = PageSize::MIN as usize; // Maps 103 data pages
+        let geometry = PtrmapGeometry::new(PageSize::MIN, 0); // Maps 102 data pages
 
         // Test pages mapped by P0 (page 2)
-        assert_eq!(get_ptrmap_page_no_for_db_page(3, page_size), 2); // D(3) -> P0(2)
-        assert_eq!(get_ptrmap_page_no_for_db_page(4, page_size), 2); // D(4) -> P0(2)
-        assert_eq!(get_ptrmap_page_no_for_db_page(5, page_size), 2); // D(5) -> P0(2)
-        assert_eq!(get_ptrmap_page_no_for_db_page(104, page_size), 2); // D(104) -> P0(2)
+        assert_eq!(geometry.ptrmap_page_no(3), 2);
+        assert_eq!(geometry.ptrmap_page_no(4), 2);
+        assert_eq!(geometry.ptrmap_page_no(5), 2);
+        assert_eq!(geometry.ptrmap_page_no(104), 2);
 
-        assert_eq!(get_ptrmap_page_no_for_db_page(105, page_size), 105); // Page 105 is a pointer map page.
+        assert_eq!(geometry.ptrmap_page_no(105), 105); // Page 105 is a pointer map page.
 
-        // Test pages mapped by P1 (page 6)
-        assert_eq!(get_ptrmap_page_no_for_db_page(106, page_size), 105); // D(106) -> P1(105)
-        assert_eq!(get_ptrmap_page_no_for_db_page(107, page_size), 105); // D(107) -> P1(105)
-        assert_eq!(get_ptrmap_page_no_for_db_page(108, page_size), 105); // D(108) -> P1(105)
+        // Test pages mapped by P1 (page 105)
+        assert_eq!(geometry.ptrmap_page_no(106), 105);
+        assert_eq!(geometry.ptrmap_page_no(107), 105);
+        assert_eq!(geometry.ptrmap_page_no(108), 105);
 
-        assert_eq!(get_ptrmap_page_no_for_db_page(208, page_size), 208); // Page 208 is a pointer map page.
+        assert_eq!(geometry.ptrmap_page_no(208), 208); // Page 208 is a pointer map page.
     }
 
     #[test]
     fn test_get_ptrmap_offset() {
-        let page_size = PageSize::MIN as usize; //  Maps 103 data pages
+        let geometry = PtrmapGeometry::new(PageSize::MIN, 0);
 
-        assert_eq!(get_ptrmap_offset_in_page(3, 2, page_size).unwrap(), 0);
-        assert_eq!(
-            get_ptrmap_offset_in_page(4, 2, page_size).unwrap(),
-            PTRMAP_ENTRY_SIZE
-        );
-        assert_eq!(
-            get_ptrmap_offset_in_page(5, 2, page_size).unwrap(),
-            2 * PTRMAP_ENTRY_SIZE
-        );
+        assert_eq!(geometry.entry_offset(3), 0);
+        assert_eq!(geometry.entry_offset(4), PTRMAP_ENTRY_SIZE);
+        assert_eq!(geometry.entry_offset(5), 2 * PTRMAP_ENTRY_SIZE);
 
         //  P1 (page 105) maps D(106)...D(207)
-        // D(106) is index 0 on P1. Offset 0.
-        // D(107) is index 1 on P1. Offset 5.
-        // D(108) is index 2 on P1. Offset 10.
-        assert_eq!(get_ptrmap_offset_in_page(106, 105, page_size).unwrap(), 0);
-        assert_eq!(
-            get_ptrmap_offset_in_page(107, 105, page_size).unwrap(),
-            PTRMAP_ENTRY_SIZE
-        );
-        assert_eq!(
-            get_ptrmap_offset_in_page(108, 105, page_size).unwrap(),
-            2 * PTRMAP_ENTRY_SIZE
-        );
+        assert_eq!(geometry.entry_offset(106), 0);
+        assert_eq!(geometry.entry_offset(107), PTRMAP_ENTRY_SIZE);
+        assert_eq!(geometry.entry_offset(108), 2 * PTRMAP_ENTRY_SIZE);
+    }
+
+    /// SQLite sizes pointer-map pages by the usable size, not the page size,
+    /// so reserved bytes at the end of each page (encryption, page codecs)
+    /// move every pointer-map page after the first.
+    #[test]
+    fn ptrmap_pages_follow_the_usable_size() {
+        // 4096-byte pages with 48 reserved bytes: 4048 / 5 = 809 entries.
+        let geometry = PtrmapGeometry::new(4096 - 48, 0);
+        assert_eq!(geometry.ptrmap_page_no(811), 2);
+        assert!(geometry.is_ptrmap_page(812));
+        assert!(!geometry.is_ptrmap_page(821));
+        assert_eq!(geometry.entry_offset(811), 808 * PTRMAP_ENTRY_SIZE);
+    }
+
+    /// A pointer-map page that would fall on the pending-byte page moves to
+    /// the next page, as in SQLite's `ptrmapPageno`.
+    #[test]
+    fn ptrmap_page_skips_the_pending_byte_page() {
+        let geometry = PtrmapGeometry::new(512, 105);
+        assert!(!geometry.is_ptrmap_page(105));
+        assert!(geometry.is_ptrmap_page(106));
+        assert!(geometry.is_unmapped_page(105));
+        assert_eq!(geometry.ptrmap_page_no(150), 106);
+        assert_eq!(geometry.entry_offset(107), 0);
+    }
+
+    /// Values from SQLite's `finalDbSize` for the same inputs.
+    #[test]
+    fn final_db_size_drops_free_pages_and_unneeded_ptrmap_pages() {
+        let geometry = PtrmapGeometry::new(1024, 0);
+        // One pointer-map page (page 2) covers pages 3..=206.
+        assert_eq!(geometry.final_db_size(307, 150), 156);
+        assert_eq!(geometry.final_db_size(32, 29), 3);
+        // Removing the pages past the second pointer-map page (207) drops it too.
+        assert_eq!(geometry.final_db_size(220, 20), 199);
+        assert_eq!(geometry.final_db_size(220, 0), 220);
     }
 
     /// Cache-hit fast path: `read_page_nonblock` must return `Done` with no

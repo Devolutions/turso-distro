@@ -1,3 +1,5 @@
+use crate::common::TempDatabase;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use turso_core::SqliteDialect;
@@ -44,4 +46,235 @@ fn test_autovacuum_readonly_behavior() {
             "autovacuum={autovacuum_mode}, flag={enable_autovacuum_flag}: expected readonly={expected_readonly}"
         );
     }
+}
+
+/// What real SQLite reports about a database file.
+#[derive(Debug, PartialEq, Eq)]
+struct SqliteView {
+    integrity_check: String,
+    page_count: i64,
+    freelist_count: i64,
+    auto_vacuum: i64,
+    root_pages: Vec<(String, i64)>,
+    row_count: usize,
+    rows_hash: u64,
+}
+
+fn sqlite_view(path: &Path) -> SqliteView {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let scalar = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+    let integrity_check = conn
+        .prepare("PRAGMA integrity_check")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let root_pages: Vec<(String, i64)> = conn
+        .prepare("SELECT name, rootpage FROM sqlite_schema WHERE rootpage > 0 ORDER BY name")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let mut rows = Vec::new();
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for table in tables {
+        let mut stmt = conn
+            .prepare(&format!("SELECT * FROM \"{table}\" ORDER BY rowid"))
+            .unwrap();
+        let columns = stmt.column_count();
+        let mut result = stmt.query([]).unwrap();
+        while let Some(row) = result.next().unwrap() {
+            let values: Vec<String> = (0..columns)
+                .map(|idx| format!("{:?}", row.get_ref(idx).unwrap()))
+                .collect();
+            rows.push(format!("{table}: {}", values.join(", ")));
+        }
+    }
+    SqliteView {
+        integrity_check,
+        page_count: scalar("PRAGMA page_count"),
+        freelist_count: scalar("PRAGMA freelist_count"),
+        auto_vacuum: scalar("PRAGMA auto_vacuum"),
+        root_pages,
+        row_count: rows.len(),
+        rows_hash: {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            rows.hash(&mut hasher);
+            hasher.finish()
+        },
+    }
+}
+
+/// Creates a database with real SQLite, the way RDM creates its files.
+fn create_sqlite_database(
+    dir: &Path,
+    name: &str,
+    auto_vacuum: &str,
+    journal_mode: &str,
+) -> PathBuf {
+    let path = dir.join(name);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(&format!(
+        "PRAGMA page_size = 1024; PRAGMA auto_vacuum = {auto_vacuum}; \
+         PRAGMA journal_mode = {journal_mode}; CREATE TABLE seed(x); DROP TABLE seed;"
+    ))
+    .unwrap();
+    path
+}
+
+fn run_in_turso(path: &Path, statements: &[&str]) {
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let db = TempDatabase::new_with_existent_with_opts(path, opts);
+    let conn = db.connect_limbo();
+    for statement in statements {
+        conn.execute(statement)
+            .unwrap_or_else(|err| panic!("{statement}: {err}"));
+    }
+    conn.close().unwrap();
+}
+
+fn run_in_sqlite(path: &Path, statements: &[&str]) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    for statement in statements {
+        let mut stmt = conn.prepare(statement).unwrap();
+        let mut rows = stmt.raw_query();
+        while rows.next().unwrap().is_some() {}
+    }
+}
+
+fn run_both(
+    dir: &Path,
+    auto_vacuum: &str,
+    journal_mode: &str,
+    statements: &[&str],
+) -> (SqliteView, SqliteView) {
+    let by_sqlite = create_sqlite_database(dir, "sqlite.db", auto_vacuum, journal_mode);
+    let by_turso = dir.join("turso.db");
+    std::fs::copy(&by_sqlite, &by_turso).unwrap();
+    run_in_sqlite(&by_sqlite, statements);
+    run_in_turso(&by_turso, statements);
+    (sqlite_view(&by_sqlite), sqlite_view(&by_turso))
+}
+
+fn used_pages(view: &SqliteView) -> i64 {
+    view.page_count - view.freelist_count
+}
+
+/// Runs `statements` with Turso and with SQLite on copies of the same
+/// SQLite-created auto-vacuum database, for both auto-vacuum modes and both
+/// journal modes, and checks that SQLite sees the same file in both cases.
+///
+/// Turso's b-tree balancing does not always split and merge pages exactly
+/// like SQLite's, so the same statements can need a different number of
+/// pages even without auto-vacuum. That difference is measured on a database
+/// without auto-vacuum and allowed; everything else must match.
+fn assert_same_file_as_sqlite(statements: &[&str]) {
+    for journal_mode in ["WAL", "DELETE"] {
+        let dir = TempDir::new().unwrap();
+        let (expected, actual) = run_both(dir.path(), "NONE", journal_mode, statements);
+        let layout_difference = used_pages(&actual) - used_pages(&expected);
+        for auto_vacuum in ["FULL", "INCREMENTAL"] {
+            let dir = TempDir::new().unwrap();
+            let (expected, actual) = run_both(dir.path(), auto_vacuum, journal_mode, statements);
+            let context = format!(
+                "auto_vacuum={auto_vacuum}, journal_mode={journal_mode}, statements={statements:?}"
+            );
+            assert_eq!(expected.integrity_check, "ok", "{context}");
+            assert_eq!(
+                used_pages(&actual) - used_pages(&expected),
+                layout_difference,
+                "{context}: {actual:?} vs {expected:?}"
+            );
+            if layout_difference == 0 {
+                assert_eq!(actual, expected, "{context}");
+            } else {
+                assert_eq!(
+                    SqliteView {
+                        page_count: expected.page_count,
+                        freelist_count: expected.freelist_count,
+                        ..actual
+                    },
+                    expected,
+                    "{context}"
+                );
+                if auto_vacuum == "FULL" {
+                    assert_eq!(actual.freelist_count, 0, "{context}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_autovacuum_btree_split_matches_sqlite() {
+    assert_same_file_as_sqlite(&[
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 2000) SELECT 'row' || value FROM s",
+    ]);
+}
+
+#[test]
+fn test_autovacuum_overflow_row_matches_sqlite() {
+    assert_same_file_as_sqlite(&[
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)",
+        "INSERT INTO t(b) VALUES (zeroblob(5000))",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 20) SELECT zeroblob(3000) FROM s",
+    ]);
+}
+
+#[test]
+fn test_autovacuum_delete_truncates_like_sqlite() {
+    assert_same_file_as_sqlite(&[
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 2000) SELECT 'row' || value FROM s",
+        "DELETE FROM t",
+    ]);
+}
+
+#[test]
+fn test_autovacuum_partial_delete_moves_pages_like_sqlite() {
+    assert_same_file_as_sqlite(&[
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)",
+        "CREATE INDEX t_b ON t(b)",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 400) SELECT hex(zeroblob(150)) || value FROM s",
+        "DELETE FROM t WHERE a BETWEEN 100 AND 300",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 10) SELECT hex(zeroblob(1000)) || value FROM s",
+    ]);
+}
+
+#[test]
+fn test_autovacuum_create_table_places_root_pages_like_sqlite() {
+    assert_same_file_as_sqlite(&[
+        "CREATE TABLE t1(a)",
+        "INSERT INTO t1 WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 200) SELECT zeroblob(500) FROM s",
+        "DELETE FROM t1 WHERE rowid > 50",
+        "CREATE TABLE t2(x)",
+        "CREATE INDEX i2 ON t2(x)",
+        "INSERT INTO t2 WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 300) SELECT value FROM s",
+    ]);
+}
+
+#[test]
+fn test_autovacuum_statement_rollback_keeps_pointer_map() {
+    assert_same_file_as_sqlite(&[
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE)",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 100) SELECT hex(zeroblob(350)) || value FROM s",
+        "BEGIN",
+        "DELETE FROM t WHERE a > 50",
+        "SAVEPOINT s",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 30) SELECT hex(zeroblob(1500)) || value FROM s",
+        "ROLLBACK TO s",
+        "INSERT INTO t(b) VALUES (hex(zeroblob(2000)))",
+        "COMMIT",
+    ]);
 }
