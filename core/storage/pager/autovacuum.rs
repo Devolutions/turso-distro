@@ -145,6 +145,10 @@ struct PtrmapLink {
 }
 
 impl Pager {
+    pub(crate) fn is_ptrmap_page(&self, page_no: u32) -> bool {
+        self.ptrmap_geometry().is_ptrmap_page(page_no)
+    }
+
     pub(super) fn ptrmap_geometry(&self) -> PtrmapGeometry {
         let pending_byte_page = self.pending_byte_page_id().unwrap_or(0);
         PtrmapGeometry::new(self.usable_space() as u32, pending_byte_page)

@@ -336,6 +336,80 @@ fn test_autovacuum_statement_rollback_keeps_pointer_map() {
     ]);
 }
 
+fn turso_integrity_check(path: &Path) -> String {
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let db = TempDatabase::new_with_existent_with_opts(path, opts);
+    let conn = db.connect_limbo();
+    let rows: Vec<(String,)> = crate::common::ExecRows::exec_rows(&conn, "PRAGMA integrity_check");
+    conn.close().unwrap();
+    rows.into_iter()
+        .map(|(text,)| text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn sqlite_integrity_check(path: &Path) -> String {
+    sqlite_view(path).integrity_check
+}
+
+fn overwrite_bytes(path: &Path, offset: u64, bytes: &[u8]) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(bytes).unwrap();
+}
+
+/// SQLite's integrity_check verifies every pointer-map entry; Turso's must
+/// find the same corruption instead of reporting "ok".
+#[test]
+fn test_integrity_check_verifies_pointer_map_entries() {
+    let dir = TempDir::new().unwrap();
+    let path = create_sqlite_database(dir.path(), "corrupt.db", "FULL", "DELETE");
+    run_in_sqlite(
+        &path,
+        &["CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)",
+          "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 500) SELECT 'row' || value FROM s"],
+    );
+    assert_eq!(sqlite_integrity_check(&path), "ok");
+    assert_eq!(turso_integrity_check(&path), "ok");
+
+    // Page 2 is the pointer-map page; the entry of page 4 is the second one.
+    // Point it at page 7 instead of its real parent.
+    let page_size = 1024;
+    overwrite_bytes(&path, page_size + 5 + 1, &7u32.to_be_bytes());
+    let sqlite_result = sqlite_integrity_check(&path);
+    assert!(
+        sqlite_result.contains("Bad ptr map entry key=4"),
+        "{sqlite_result}"
+    );
+    let turso_result = turso_integrity_check(&path);
+    assert!(
+        turso_result.contains("Bad ptr map entry key=4"),
+        "{turso_result}"
+    );
+}
+
+#[test]
+fn test_integrity_check_verifies_largest_root_page() {
+    let dir = TempDir::new().unwrap();
+    let path = create_sqlite_database(dir.path(), "corrupt.db", "FULL", "DELETE");
+    run_in_sqlite(&path, &["CREATE TABLE t(a)", "CREATE TABLE u(a)"]);
+    assert_eq!(turso_integrity_check(&path), "ok");
+
+    // The largest root page lives at offset 52 of the database header.
+    overwrite_bytes(&path, 52, &3u32.to_be_bytes());
+    let sqlite_result = sqlite_integrity_check(&path);
+    assert!(
+        sqlite_result.contains("max rootpage (4) disagrees with header (3)"),
+        "{sqlite_result}"
+    );
+    let turso_result = turso_integrity_check(&path);
+    assert!(
+        turso_result.contains("max rootpage (4) disagrees with header (3)"),
+        "{turso_result}"
+    );
+}
+
 /// The pager moves the largest root page when it creates and drops b-trees;
 /// an MVCC checkpoint must not put back the value its logical header had.
 #[test]
