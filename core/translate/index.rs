@@ -38,7 +38,7 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
-use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use super::schema::{emit_destroy_root_page, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
 fn canonical_create_index_sql(
     stmt: &ast::Stmt,
@@ -1505,12 +1505,11 @@ pub fn translate_drop_index(
         });
     } else {
         // Destroy index btree
-        program.emit_insn(Insn::Destroy {
-            db: database_id,
-            root: index.root_page,
-            former_root_reg: 0,
-            is_temp: 0,
-        });
+        let schema_table = resolver
+            .schema()
+            .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            .expect("sqlite_schema exists");
+        emit_destroy_root_page(program, database_id, index.root_page, &schema_table);
     }
 
     // Remove from the Schema any mention of the index

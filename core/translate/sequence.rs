@@ -24,7 +24,9 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::functions::{names_mangled_sequence, qualify_sequence_argument};
 use crate::translate::expr::{walk_expr_mut, WalkControl};
-use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use crate::translate::schema::{
+    emit_destroy_root_page, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID,
+};
 use crate::translate::trigger_exec::rewrite_select_expressions;
 use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -1099,13 +1101,11 @@ pub(crate) fn emit_drop_sequence_cleanup(
     program.preassign_label_to_next_insn(end_loop_label);
 
     // Destroy the B-tree root page
-    let former_root_reg = program.alloc_register();
-    program.emit_insn(Insn::Destroy {
-        db: database_id,
-        root: root_page,
-        former_root_reg,
-        is_temp: 0,
-    });
+    let schema_table = resolver
+        .schema()
+        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+        .expect("sqlite_schema exists");
+    emit_destroy_root_page(program, database_id, root_page, &schema_table);
 
     // Remove from the in-memory schema (sequences + tables maps)
     program.emit_insn(Insn::DropSequence {

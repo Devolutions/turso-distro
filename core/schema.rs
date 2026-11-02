@@ -2417,6 +2417,35 @@ impl Schema {
         self.analyze_stats.remove_table(namespace, &name);
     }
 
+    /// Points the table or index whose root page was `from` at page `to`,
+    /// after auto-vacuum moved that root page (SQLite's `sqlite3RootPageMoved`).
+    pub fn root_page_moved(&mut self, from: i64, to: i64) {
+        for namespace in self.namespaces.values_mut() {
+            for table in namespace.tables.values_mut() {
+                if let Table::BTree(btree) = table.as_ref() {
+                    if btree.root_page == from {
+                        let mut moved = BTreeTable::clone(btree);
+                        moved.root_page = to;
+                        *table = Arc::new(Table::BTree(Arc::new(moved)));
+                    }
+                }
+            }
+            for indexes in namespace.indexes.values_mut() {
+                for index in indexes.iter_mut() {
+                    if index.root_page == from {
+                        let mut moved = Index::clone(index);
+                        moved.root_page = to;
+                        *index = Arc::new(moved);
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "conn_raw_api")]
+        if let Some(name) = self.table_names_by_root_page.remove(&from) {
+            self.table_names_by_root_page.insert(to, name);
+        }
+    }
+
     pub fn remove_index(&mut self, namespace: NamespaceId, idx: &Index) {
         let name = normalize_ident(&idx.table_name);
         self.namespace_mut(namespace)

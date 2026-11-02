@@ -14947,6 +14947,11 @@ pub fn op_destroy(
             OpDestroyState::DestroyBtree(ref mut cursor) => {
                 let destroyed = cursor.write().btree_destroy();
                 let maybe_former_root_page = return_if_io!(state, destroyed);
+                if let Some(former_root_page) = maybe_former_root_page {
+                    program.connection.with_database_schema_mut(*db, |schema| {
+                        schema.root_page_moved(former_root_page as i64, *root)
+                    })?;
+                }
                 state.registers[*former_root_reg]
                     .set_int(maybe_former_root_page.unwrap_or(0) as i64);
                 state.active_op_state.clear();

@@ -884,6 +884,10 @@ pub struct BTreeCursor {
     root_page: i64,
     /// Rowid and record are stored before being consumed.
     pub has_record: bool,
+    /// `btree_destroy` has freed every page but the root and is now freeing
+    /// the root page, which may move another root page into its place.
+    #[cfg(feature = "autovacuum")]
+    freeing_root_page: bool,
     null_flag: bool,
     /// Index internal pages are consumed on the way up, so we store going upwards flag in case
     /// we just moved to a parent page and the parent page is an internal index page which requires
@@ -1303,6 +1307,8 @@ impl BTreeCursor {
             usable_space_cached: usable_space,
             payload_limits: PayloadLimits::new(usable_space),
             has_record: false,
+            #[cfg(feature = "autovacuum")]
+            freeing_root_page: false,
             null_flag: false,
             going_upwards: false,
             state: CursorState::None,
@@ -7478,14 +7484,29 @@ impl CursorTrait for BTreeCursor {
     /// For cases where the B-Tree should remain allocated but emptied, see [`btree_clear`].
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
-        // See clear_btree for the state==None gate rationale.
-        if matches!(self.state, CursorState::None) {
-            self.pager.invalidate_peer_cursors(self);
+        #[cfg(feature = "autovacuum")]
+        {
+            if !self.freeing_root_page {
+                // See clear_btree for the state==None gate rationale.
+                if matches!(self.state, CursorState::None) {
+                    self.pager.invalidate_peer_cursors(self);
+                }
+                return_if_io!(self.destroy_btree_contents(true));
+                self.freeing_root_page = true;
+            }
+            let moved_root = return_if_io!(self.pager.free_root_page(self.root_page as u32));
+            self.freeing_root_page = false;
+            Ok(IOResult::Done(moved_root.map(|page| page as usize)))
         }
-        let destroyed = self.destroy_btree_contents(false)?;
-        //  TODO: For now, no-op the result return None always. This will change once [AUTO_VACUUM](https://www.sqlite.org/lang_vacuum.html) is introduced
-        //  At that point, the last root page(call this x) will be moved into the position of the root page of this table and the value returned will be x
-        Ok(destroyed.map(|_| None))
+        #[cfg(not(feature = "autovacuum"))]
+        {
+            // See clear_btree for the state==None gate rationale.
+            if matches!(self.state, CursorState::None) {
+                self.pager.invalidate_peer_cursors(self);
+            }
+            let destroyed = self.destroy_btree_contents(false)?;
+            Ok(destroyed.map(|_| None))
+        }
     }
 
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]

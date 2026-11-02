@@ -7,7 +7,7 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::sequence::bind_sequence_names_in_select;
 use crate::translate::{
     emitter::Resolver,
-    schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+    schema::{emit_destroy_root_page, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
 };
 use crate::util::{
     escape_sql_string_literal, extract_view_columns, normalize_ident,
@@ -559,6 +559,10 @@ pub fn translate_drop_view(
         }
     }
 
+    let schema_table = resolver
+        .schema()
+        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+        .unwrap();
     // If this is a materialized view, we need to destroy its btree as well
     // and also clean up its internal tables (aggregate state, MIN/MAX
     // multiset) — those that exist for its shape.
@@ -568,22 +572,12 @@ pub fn translate_drop_view(
         }) {
             if let Some(btree_table) = table.btree() {
                 // Destroy the btree for the materialized view
-                program.emit_insn(Insn::Destroy {
-                    db: database_id,
-                    root: btree_table.root_page,
-                    former_root_reg: 0, // No autovacuum
-                    is_temp: 0,
-                });
+                emit_destroy_root_page(program, database_id, btree_table.root_page, &schema_table);
             }
         } else if let Some(root_page) = resolver.with_schema(database_id, |s| {
             s.incompatible_materialized_view_root(namespace.id, &normalized_view_name)
         }) {
-            program.emit_insn(Insn::Destroy {
-                db: database_id,
-                root: root_page,
-                former_root_reg: 0,
-                is_temp: 0,
-            });
+            emit_destroy_root_page(program, database_id, root_page, &schema_table);
         }
 
         // Every node-owned hidden state/multiset table of this view, including
@@ -612,24 +606,19 @@ pub fn translate_drop_view(
                 .collect()
         });
         for index in &internal_indexes {
-            program.emit_insn(Insn::Destroy {
-                db: database_id,
-                root: index.root_page,
-                former_root_reg: 0, // No autovacuum
-                is_temp: 0,
-            });
+            emit_destroy_root_page(program, database_id, index.root_page, &schema_table);
         }
 
         if let Some(internal_table) = resolver.with_schema(database_id, |s| {
             s.get_table(NamespaceId::ROOT, internal_table_name)
         }) {
             if let Some(internal_btree) = internal_table.btree() {
-                program.emit_insn(Insn::Destroy {
-                    db: database_id,
-                    root: internal_btree.root_page,
-                    former_root_reg: 0, // No autovacuum
-                    is_temp: 0,
-                });
+                emit_destroy_root_page(
+                    program,
+                    database_id,
+                    internal_btree.root_page,
+                    &schema_table,
+                );
             }
         }
     }

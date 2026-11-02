@@ -265,6 +265,50 @@ fn test_autovacuum_create_table_places_root_pages_like_sqlite() {
 }
 
 #[test]
+fn test_autovacuum_drop_table_moves_largest_root_like_sqlite() {
+    assert_same_file_as_sqlite(&[
+        "CREATE TABLE t1(a)",
+        "CREATE TABLE t2(a)",
+        "CREATE INDEX i1 ON t1(a)",
+        "CREATE TABLE t3(a, b)",
+        "CREATE INDEX i3 ON t3(b)",
+        "INSERT INTO t1 WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 500) SELECT value FROM s",
+        "INSERT INTO t2 WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 500) SELECT value FROM s",
+        "INSERT INTO t3 WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 500) SELECT value, value FROM s",
+        "DROP TABLE t1",
+        "INSERT INTO t3 VALUES (1, 2)",
+        "DROP INDEX i3",
+        "INSERT INTO t2 WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 100) SELECT value FROM s",
+    ]);
+}
+
+/// The sqlite_schema row of a moved root page is rewritten in place, so the
+/// rows of sqlite_schema stay in rowid order. These are the statements of a
+/// randomized run that found rows out of order.
+#[test]
+fn test_autovacuum_drop_table_keeps_sqlite_schema_in_rowid_order() {
+    assert_same_file_as_sqlite(&[
+        "CREATE TABLE t0(a INTEGER PRIMARY KEY, b TEXT)",
+        "CREATE INDEX t0_b ON t0(b)",
+        "CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT)",
+        "CREATE INDEX t1_b ON t1(b)",
+        "CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT)",
+        "CREATE INDEX t2_b ON t2(b)",
+        "CREATE TABLE t3(a INTEGER PRIMARY KEY, b TEXT)",
+        "DROP TABLE t0",
+        "CREATE TABLE t4(a INTEGER PRIMARY KEY, b TEXT)",
+        "DROP TABLE t1",
+        "CREATE TABLE t5(a INTEGER PRIMARY KEY, b TEXT)",
+        "CREATE INDEX t5_b ON t5(b)",
+        "CREATE TABLE t6(a INTEGER PRIMARY KEY, b TEXT)",
+        "CREATE INDEX t6_b ON t6(b)",
+        "CREATE TABLE t7(a INTEGER PRIMARY KEY, b TEXT)",
+        "DROP TABLE t4",
+        "INSERT INTO t7 VALUES (1, 'x')",
+    ]);
+}
+
+#[test]
 fn test_autovacuum_statement_rollback_keeps_pointer_map() {
     assert_same_file_as_sqlite(&[
         "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE)",
@@ -277,4 +321,28 @@ fn test_autovacuum_statement_rollback_keeps_pointer_map() {
         "INSERT INTO t(b) VALUES (hex(zeroblob(2000)))",
         "COMMIT",
     ]);
+}
+
+/// The pager moves the largest root page when it creates and drops b-trees;
+/// an MVCC checkpoint must not put back the value its logical header had.
+#[test]
+fn test_mvcc_checkpoint_keeps_the_largest_root_page() {
+    let dir = TempDir::new().unwrap();
+    let path = create_sqlite_database(dir.path(), "mvcc.db", "FULL", "WAL");
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE a(x)").unwrap();
+    conn.execute("CREATE TABLE b(x)").unwrap();
+    conn.execute("CREATE INDEX b_x ON b(x)").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let rows: Vec<(i64,)> =
+        crate::common::ExecRows::exec_rows(&conn, "SELECT max(rootpage) FROM sqlite_schema");
+    conn.close().unwrap();
+    drop(db);
+
+    let header = std::fs::read(&path).unwrap();
+    let largest_root_page = u32::from_be_bytes(header[52..56].try_into().unwrap());
+    assert_eq!(largest_root_page as i64, rows[0].0);
 }
