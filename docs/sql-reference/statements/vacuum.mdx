@@ -27,7 +27,8 @@ These rules apply to both `VACUUM` and `VACUUM INTO`:
 - The connection must be in autocommit mode — neither form can run inside an explicit `BEGIN` transaction.
 - No other statement may be active on the same connection.
 - The connection must not be in `query_only` mode.
-- The source database must not have `auto_vacuum = incremental`. Incremental autovacuum is not supported.
+
+The rebuilt database gets the `auto_vacuum` mode last set with [`PRAGMA auto_vacuum`](/docs/sql-reference/pragmas) on the connection, or else the mode of the source database. As in SQLite, this is how a database gains or loses auto-vacuum: setting `PRAGMA auto_vacuum` on a database that already has pages only switches between `full` and `incremental`.
 
 ## VACUUM
 
@@ -147,7 +148,6 @@ VACUUM;
 | `Cannot execute VACUUM in query_only mode` | `VACUUM` or `VACUUM INTO` run on a connection where `PRAGMA query_only` is set. |
 | `cannot VACUUM from within a transaction` / `cannot VACUUM INTO from within a transaction` | Run inside an explicit `BEGIN`. |
 | `cannot VACUUM - SQL statements in progress` | Another statement is still active on the same connection. |
-| `Incremental auto-vacuum is not supported` | The source database has `auto_vacuum = incremental`. Applies to both `VACUUM` and `VACUUM INTO`. |
 | `VACUUM requires a WAL-mode database` | In-place `VACUUM` on a non-WAL database. |
 | `cannot VACUUM an in-memory database` | In-place `VACUUM` on an in-memory database. |
 | `ReadOnly` | In-place `VACUUM` on a read-only database. |

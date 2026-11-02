@@ -32,16 +32,6 @@ use crate::{
     bail_corrupt_error, io_yield_one, return_if_io, turso_assert, turso_assert_eq, Result,
 };
 
-pub(super) fn auto_vacuum_mode_of(header: &DatabaseHeader) -> AutoVacuumMode {
-    if header.vacuum_mode_largest_root_page.get() == 0 {
-        AutoVacuumMode::None
-    } else if header.incremental_vacuum_enabled.get() != 0 {
-        AutoVacuumMode::Incremental
-    } else {
-        AutoVacuumMode::Full
-    }
-}
-
 /// How [`Pager::freelist_take`] picks the page it removes from the freelist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FreelistTake {
@@ -728,7 +718,7 @@ impl Pager {
                         self.vacuum_state.write().auto_vacuum.commit = CommitState::Done;
                         continue;
                     }
-                    let mode = return_if_io!(self.with_header(auto_vacuum_mode_of));
+                    let mode = return_if_io!(self.with_header(AutoVacuumMode::from_header));
                     self.vacuum_state.write().auto_vacuum.commit = match mode {
                         AutoVacuumMode::None => CommitState::Done,
                         AutoVacuumMode::Full | AutoVacuumMode::Incremental => {
@@ -740,7 +730,7 @@ impl Pager {
                     return_if_io!(self.ptrmap_sync_dirty_pages());
                     let (mode, database_size, freelist_pages) =
                         return_if_io!(self.with_header(|header| (
-                            auto_vacuum_mode_of(header),
+                            AutoVacuumMode::from_header(header),
                             header.database_size.get(),
                             header.freelist_pages.get()
                         )));
@@ -817,7 +807,7 @@ impl Pager {
             let state = self.vacuum_state.read().auto_vacuum.incremental;
             match state {
                 IncrementalVacuumState::Start => {
-                    let mode = return_if_io!(self.with_header(auto_vacuum_mode_of));
+                    let mode = return_if_io!(self.with_header(AutoVacuumMode::from_header));
                     if mode == AutoVacuumMode::None || max_pages == 0 {
                         return Ok(IOResult::Done(()));
                     }
@@ -1000,7 +990,7 @@ impl Pager {
             match state {
                 DropRootState::Start => {
                     let (mode, largest_root) = return_if_io!(self.with_header(|header| (
-                        auto_vacuum_mode_of(header),
+                        AutoVacuumMode::from_header(header),
                         header.vacuum_mode_largest_root_page.get()
                     )));
                     if mode == AutoVacuumMode::None {

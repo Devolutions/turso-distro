@@ -33,7 +33,7 @@ use crate::{
         journal_mode,
         page_cache::PageCache,
         page_transform::PageTransform,
-        pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut, SharedPagerState},
+        pager::{self, HeaderRef, HeaderRefMut, SharedPagerState},
         sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion, TextEncoding, Version},
     },
     sync::{
@@ -1842,11 +1842,11 @@ impl Database {
                     };
                 }
                 InitState::ReadPage1 { pager } => {
-                    // Read page 1 within the read transaction to determine the
-                    // autovacuum mode. The read tx stays open across an IO
-                    // yield here (re-entry resumes the read); we only end it
-                    // once the read completes or errors.
-                    let mode = match HeaderRef::from_pager(pager) {
+                    // Read page 1 within the read transaction to check it
+                    // against the page codec. The read tx stays open across
+                    // an IO yield here (re-entry resumes the read); we only
+                    // end it once the read completes or errors.
+                    match HeaderRef::from_pager(pager) {
                         Ok(IOResult::Done(header_ref)) => {
                             let header = header_ref.borrow();
                             let validate_codec_header = || -> Result<()> {
@@ -1891,15 +1891,6 @@ impl Database {
                                 pager.end_read_tx();
                                 return Err(err.into());
                             }
-                            if header.vacuum_mode_largest_root_page.get() > 0 {
-                                if header.incremental_vacuum_enabled.get() > 0 {
-                                    AutoVacuumMode::Incremental
-                                } else {
-                                    AutoVacuumMode::Full
-                                }
-                            } else {
-                                AutoVacuumMode::None
-                            }
                         }
                         Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                         Err(err) => {
@@ -1909,7 +1900,6 @@ impl Database {
                     };
 
                     pager.end_read_tx();
-                    pager.set_auto_vacuum_mode(mode);
 
                     let InitState::ReadPage1 { pager } = std::mem::take(st) else {
                         unreachable!("state is ReadPage1");

@@ -584,18 +584,24 @@ fn update_pragma(
 
             let pager = connection.get_pager_from_database_index(&database_id)?;
 
-            // Like SQLite, the auto-vacuum mode is fixed once page 1 exists,
-            // so the pragma is silently ignored after that.
-            if pager.db_initialized() {
-                return Ok(TransactionMode::None);
-            }
-
             let Some(auto_vacuum_mode) = requested_mode else {
                 return Err(LimboError::InvalidArgument(
                     "invalid auto vacuum mode".to_string(),
                 ));
             };
-            pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
+
+            // Like SQLite's db->nextAutovac, the requested mode is what the
+            // next VACUUM gives the database. A database without page 1
+            // takes it when page 1 is written; one with page 1 can only
+            // switch between FULL and INCREMENTAL, which the program below
+            // does in a write transaction.
+            pager.set_requested_auto_vacuum_mode(auto_vacuum_mode);
+            if !pager.db_initialized() {
+                pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
+            }
+            if auto_vacuum_mode == AutoVacuumMode::None {
+                return Ok(TransactionMode::None);
+            }
             let largest_root_page_number_reg = program.alloc_register();
             program.emit_insn(Insn::ReadCookie {
                 db: database_id,
@@ -621,7 +627,7 @@ fn update_pragma(
                 value: i32::from(u8::from(auto_vacuum_mode)) - 1,
                 p5: 0,
             });
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Write)
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
@@ -1524,23 +1530,38 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::AutoVacuum => {
-            let pager = connection.get_pager_from_database_index(&database_id)?;
-            let auto_vacuum_mode = pager.get_auto_vacuum_mode();
-            let auto_vacuum_mode_i64: i64 = match auto_vacuum_mode {
-                AutoVacuumMode::None => 0,
-                AutoVacuumMode::Full => 1,
-                AutoVacuumMode::Incremental => 2,
-            };
-            let register = program.alloc_register();
-            program.emit_insn(Insn::Int64 {
-                _p1: 0,
-                out_reg: register,
-                _p3: 0,
-                value: auto_vacuum_mode_i64,
+            // The mode is read from page 1 in the transaction, so a mode
+            // change that was rolled back is not reported.
+            let largest_root_page_reg = program.alloc_register();
+            let incremental_reg = program.alloc_register();
+            program.emit_insn(Insn::ReadCookie {
+                db: database_id,
+                dest: largest_root_page_reg,
+                cookie: Cookie::LargestRootPageNumber,
             });
+            program.emit_insn(Insn::ReadCookie {
+                db: database_id,
+                dest: incremental_reg,
+                cookie: Cookie::IncrementalVacuum,
+            });
+            let done_label = program.allocate_label();
+            program.emit_int(u8::from(AutoVacuumMode::None).into(), register);
+            program.emit_insn(Insn::IfNot {
+                reg: largest_root_page_reg,
+                target_pc: done_label,
+                jump_if_null: true,
+            });
+            program.emit_int(u8::from(AutoVacuumMode::Full).into(), register);
+            program.emit_insn(Insn::IfNot {
+                reg: incremental_reg,
+                target_pc: done_label,
+                jump_if_null: true,
+            });
+            program.emit_int(u8::from(AutoVacuumMode::Incremental).into(), register);
+            program.preassign_label_to_next_insn(done_label);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);

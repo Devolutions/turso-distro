@@ -460,6 +460,169 @@ fn test_auto_vacuum_pragma_on_temp_database_leaves_main_unchanged() -> anyhow::R
     Ok(())
 }
 
+/// Setting a mode on an empty database writes page 1, so the mode is on disk
+/// without any further write, and SQLite treats the database as initialized.
+#[test]
+fn test_auto_vacuum_pragma_alone_is_saved_to_disk() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA auto_vacuum = full")?;
+    assert_eq!(scalar_i64(&conn, "PRAGMA page_count"), 1);
+    conn.execute("PRAGMA auto_vacuum = none")?;
+    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 1);
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, opts);
+    let reopened_conn = reopened.connect_limbo();
+    assert_eq!(scalar_i64(&reopened_conn, "PRAGMA auto_vacuum"), 1);
+
+    let sqlite_conn = SqliteConnection::open(&tmp_db.path)?;
+    assert_eq!(sqlite_scalar_i64(&sqlite_conn, "PRAGMA auto_vacuum"), 1);
+    Ok(())
+}
+
+/// The pragma used to change page 1 with no transaction open, so the next
+/// statement of an explicit transaction panicked on the leftover dirty page.
+#[test]
+fn test_auto_vacuum_pragma_inside_explicit_transaction() -> anyhow::Result<()> {
+    for end_of_transaction in ["COMMIT", "ROLLBACK"] {
+        let opts = DatabaseOpts::new().with_autovacuum(true);
+        let tmp_db = TempDatabase::builder().with_opts(opts).build();
+        let conn = tmp_db.connect_limbo();
+
+        conn.execute("BEGIN")?;
+        conn.execute("PRAGMA auto_vacuum = full")?;
+        conn.execute(end_of_transaction)?;
+
+        assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 1);
+        conn.execute("CREATE TABLE t(x)")?;
+        assert_eq!(run_integrity_check(&conn), "ok");
+    }
+    Ok(())
+}
+
+/// A database that already has auto-vacuum can switch between FULL and
+/// INCREMENTAL without a VACUUM, which only changes one header field.
+#[test]
+fn test_auto_vacuum_pragma_switches_between_full_and_incremental() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA auto_vacuum = full")?;
+    conn.execute("CREATE TABLE t(x)")?;
+    conn.execute("PRAGMA auto_vacuum = incremental")?;
+    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 2);
+
+    let sqlite_conn = SqliteConnection::open(&tmp_db.path)?;
+    assert_eq!(sqlite_scalar_i64(&sqlite_conn, "PRAGMA auto_vacuum"), 2);
+    drop(sqlite_conn);
+
+    conn.execute("INSERT INTO t SELECT zeroblob(3000) FROM generate_series(1, 20)")?;
+    conn.execute("DELETE FROM t")?;
+    assert!(scalar_i64(&conn, "PRAGMA freelist_count") > 0);
+
+    conn.execute("PRAGMA auto_vacuum = full")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 1);
+    assert_eq!(scalar_i64(&conn, "PRAGMA freelist_count"), 0);
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, opts);
+    let reopened_conn = reopened.connect_limbo();
+    assert_eq!(scalar_i64(&reopened_conn, "PRAGMA auto_vacuum"), 1);
+    Ok(())
+}
+
+/// The switch is part of the transaction, as in SQLite.
+#[test]
+fn test_auto_vacuum_pragma_switch_rolls_back_with_its_transaction() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA auto_vacuum = full")?;
+    conn.execute("CREATE TABLE t(x)")?;
+    conn.execute("BEGIN")?;
+    conn.execute("PRAGMA auto_vacuum = incremental")?;
+    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 2);
+    conn.execute("ROLLBACK")?;
+    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 1);
+
+    let sqlite_conn = SqliteConnection::open(&tmp_db.path)?;
+    assert_eq!(sqlite_scalar_i64(&sqlite_conn, "PRAGMA auto_vacuum"), 1);
+    Ok(())
+}
+
+/// Turning auto-vacuum on or off needs a VACUUM, which uses the mode last set
+/// with the pragma (SQLite's db->nextAutovac), for VACUUM and VACUUM INTO.
+#[test]
+fn test_vacuum_applies_the_requested_auto_vacuum_mode() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_autovacuum(true).with_vacuum(true);
+    for (from, to, expected) in [
+        ("full", "none", 0),
+        ("none", "full", 1),
+        ("none", "incremental", 2),
+    ] {
+        let (_temp_dir, tmp_db) = open_sqlite_autovacuum_db(from, opts)?;
+        let conn = tmp_db.connect_limbo();
+        let initial = scalar_i64(&conn, "PRAGMA auto_vacuum");
+
+        conn.execute(format!("PRAGMA auto_vacuum = {to}"))?;
+        assert_eq!(
+            scalar_i64(&conn, "PRAGMA auto_vacuum"),
+            initial,
+            "{from} -> {to}"
+        );
+
+        let dest_dir = TempDir::new()?;
+        let dest_path = dest_dir.path().join("vacuum-into.db");
+        conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+        let sqlite_conn = SqliteConnection::open(&dest_path)?;
+        assert_eq!(
+            sqlite_scalar_i64(&sqlite_conn, "PRAGMA auto_vacuum"),
+            expected
+        );
+        let integrity: String =
+            sqlite_conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        assert_eq!(integrity, "ok", "VACUUM INTO {from} -> {to}");
+        drop(sqlite_conn);
+
+        conn.execute("VACUUM")?;
+        assert_eq!(
+            scalar_i64(&conn, "PRAGMA auto_vacuum"),
+            expected,
+            "{from} -> {to}"
+        );
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 120);
+        assert_eq!(run_integrity_check(&conn), "ok");
+        let path = tmp_db.path.clone();
+        drop(conn);
+        drop(tmp_db);
+
+        let sqlite_conn = SqliteConnection::open(&path)?;
+        assert_eq!(
+            sqlite_scalar_i64(&sqlite_conn, "PRAGMA auto_vacuum"),
+            expected
+        );
+        let integrity: String =
+            sqlite_conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        assert_eq!(integrity, "ok", "VACUUM {from} -> {to}");
+        // Page 2 is the first pointer-map page of an auto-vacuum database.
+        let first_root_page = if expected == 0 { 2 } else { 3 };
+        assert_eq!(
+            sqlite_scalar_i64(
+                &sqlite_conn,
+                "SELECT min(rootpage) FROM sqlite_schema WHERE rootpage > 0"
+            ),
+            first_root_page,
+            "VACUUM {from} -> {to}"
+        );
+    }
+    Ok(())
+}
+
 fn assert_plain_vacuum_preserves_autovacuum_mode(
     pragma_value: &str,
     expected_mode: i64,
@@ -5516,47 +5679,13 @@ fn test_mvcc_vacuum_into_preserves_full_autovacuum_after_reopen() -> anyhow::Res
 }
 
 #[test]
-fn test_plain_vacuum_incremental_autovacuum_still_unsupported() -> anyhow::Result<()> {
-    let opts = DatabaseOpts::new()
-        .with_encryption(true)
-        .with_autovacuum(true);
-    let (_temp_dir, tmp_db) = open_sqlite_autovacuum_db("incremental", opts)?;
-    let conn = tmp_db.connect_limbo();
-
-    let err = conn.execute("VACUUM").unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "Internal error: Incremental auto-vacuum is not supported",
-        "unexpected error: {err}"
-    );
-
-    Ok(())
+fn test_plain_vacuum_preserves_incremental_autovacuum() -> anyhow::Result<()> {
+    assert_plain_vacuum_preserves_autovacuum_mode("incremental", 2)
 }
 
 #[test]
-fn test_vacuum_into_incremental_autovacuum_still_unsupported() -> anyhow::Result<()> {
-    let opts = DatabaseOpts::new()
-        .with_encryption(true)
-        .with_autovacuum(true);
-    let (_temp_dir, tmp_db) = open_sqlite_autovacuum_db("incremental", opts)?;
-    let conn = tmp_db.connect_limbo();
-    let dest_dir = TempDir::new()?;
-    let dest_path = dest_dir.path().join("vacuum-into.db");
-
-    let err = conn
-        .execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))
-        .unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "Internal error: Incremental auto-vacuum is not supported",
-        "unexpected error: {err}"
-    );
-    assert!(
-        !dest_path.exists(),
-        "unsupported VACUUM INTO should not leave an output file behind"
-    );
-
-    Ok(())
+fn test_vacuum_into_preserves_incremental_autovacuum() -> anyhow::Result<()> {
+    assert_vacuum_into_preserves_autovacuum_mode("incremental", 2)
 }
 
 /// Keep one non-ignored plain VACUUM test under the checksum feature so

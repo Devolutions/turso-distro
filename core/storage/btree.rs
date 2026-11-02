@@ -8041,13 +8041,16 @@ pub struct IntegrityCheckState {
     pub page_reference: HashMap<i64, i64>,
     page: Option<PageRef>,
     pub freelist_count: CheckFreelist,
+    /// The database has auto-vacuum, so pointer-map pages are never referenced.
+    pub auto_vacuum: bool,
 }
 
 impl IntegrityCheckState {
-    pub fn new(db_size: usize) -> Self {
+    pub fn new(db_size: usize, auto_vacuum: bool) -> Self {
         Self {
             page_stack: crate::alloc::vec![],
             db_size,
+            auto_vacuum,
             page_reference: HashMap::default(),
             first_leaf_level: None,
             page: None,
@@ -10947,14 +10950,14 @@ mod tests {
         let balance = BalanceState::default();
         assert_alloc_vec(&balance.reusable_divider_buffers[0]);
         assert_alloc_vec(&balance.reusable_cell_payloads);
-        let integrity_check = IntegrityCheckState::new(0);
+        let integrity_check = IntegrityCheckState::new(0, false);
         assert_alloc_vec(&integrity_check.page_stack);
         let op_integrity_check =
             crate::vdbe::execute::OpIntegrityCheckState::CheckingBTreeStructure {
                 errors: crate::alloc::vec![],
                 current_root_idx: 0,
                 current_dropped_idx: 0,
-                state: IntegrityCheckState::new(0),
+                state: IntegrityCheckState::new(0, false),
             };
         let crate::vdbe::execute::OpIntegrityCheckState::CheckingBTreeStructure { errors, .. } =
             op_integrity_check
