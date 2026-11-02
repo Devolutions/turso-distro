@@ -245,7 +245,7 @@ avoid this window.
 | PRAGMA function_list             | ✅ Yes        |                                              |
 | PRAGMA hard_heap_limit           | ❌ No         |                                              |
 | PRAGMA ignore_check_constraints  | ✅ Yes        |                                              |
-| PRAGMA incremental_vacuum        | ✅ Yes        | Requires `--experimental-autovacuum`; returns no rows (SQLite returns one empty row per page) |
+| PRAGMA incremental_vacuum        | ✅ Yes        | Requires `--experimental-autovacuum` |
 | PRAGMA index_info                | ✅ Yes        |                                              |
 | PRAGMA index_list                | ✅ Yes        |                                              |
 | PRAGMA index_xinfo               | ✅ Yes        |                                              |

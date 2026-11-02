@@ -19714,15 +19714,22 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
     }
 }
 
-/// `PRAGMA incremental_vacuum`: moves up to `max_pages` pages from the end
-/// of an auto-vacuum database into free pages and truncates the file.
+/// One step of `PRAGMA incremental_vacuum`: moves the last page of an
+/// auto-vacuum database into a free page and shortens the database by one
+/// page, or jumps to `target_pc` when there is no free page (SQLite's
+/// `OP_IncrVacuum`).
 pub fn op_incr_vacuum(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(IncrVacuum { db, max_pages }, insn);
+    load_insn!(IncrVacuum { db, target_pc }, insn);
+    if !target_pc.is_offset() {
+        return Err(unresolved_branch_target(*target_pc));
+    }
+    #[cfg_attr(not(feature = "autovacuum"), allow(unused_mut))]
+    let mut progressed = false;
     if program.connection.mv_store_for_db(*db).is_none() {
         let vacuum_pager = if *db != MAIN_DB_ID {
             program.get_pager_from_database_index(db)?
@@ -19730,11 +19737,17 @@ pub fn op_incr_vacuum(
             pager.clone()
         };
         #[cfg(feature = "autovacuum")]
-        return_if_io!(state, vacuum_pager.incremental_vacuum(*max_pages));
+        {
+            progressed = return_if_io!(state, vacuum_pager.incremental_vacuum_step());
+        }
         #[cfg(not(feature = "autovacuum"))]
-        let _ = (vacuum_pager, max_pages);
+        let _ = vacuum_pager;
     }
-    state.pc += 1;
+    if progressed {
+        state.pc += 1;
+    } else {
+        state.pc = target_pc.as_offset_int();
+    }
     Ok(InsnFunctionStepResult::Step)
 }
 

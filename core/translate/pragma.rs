@@ -866,15 +866,29 @@ fn query_pragma(
             // Like SQLite, a missing, non-positive or out-of-range page count
             // vacuums every free page.
             let max_pages = match value.as_ref().map(parse_signed_number) {
-                Some(Ok(Value::Numeric(Numeric::Integer(n)))) if n > 0 && n <= i32::MAX as i64 => {
-                    n as u32
-                }
-                _ => i32::MAX as u32,
+                Some(Ok(Value::Numeric(Numeric::Integer(n)))) if n > 0 && n <= i32::MAX as i64 => n,
+                _ => i32::MAX as i64,
             };
+            // As in SQLite, each page moved returns a row with no columns.
+            program.emit_int(max_pages, register);
+            let step = program.allocate_label();
+            let done = program.allocate_label();
+            program.preassign_label_to_next_insn(step);
             program.emit_insn(Insn::IncrVacuum {
                 db: database_id,
-                max_pages,
+                target_pc: done,
             });
+            program.emit_result_row(register, 0);
+            program.emit_insn(Insn::AddImm {
+                register,
+                value: -1,
+            });
+            program.emit_insn(Insn::IfPos {
+                reg: register,
+                target_pc: step,
+                decrement_by: 0,
+            });
+            program.preassign_label_to_next_insn(done);
             Ok(TransactionMode::Write)
         }
         PragmaName::ApplicationId => {

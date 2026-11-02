@@ -2119,10 +2119,11 @@ pub enum Insn {
         dest_path: String,
     },
 
-    /// Run up to `max_pages` steps of `PRAGMA incremental_vacuum` on database `db`.
+    /// Run one step of `PRAGMA incremental_vacuum` on database `db`, or jump
+    /// to `target_pc` when its freelist is empty.
     IncrVacuum {
         db: usize,
-        max_pages: u32,
+        target_pc: BranchOffset,
     },
 
     /// In-place VACUUM - compact the database (by writing to a temporary location and then copying

@@ -81,7 +81,7 @@ enum IncrementalVacuumState {
     Start,
     SyncPtrmap,
     SaveCursors,
-    Step { pages_left: u32 },
+    Step,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -812,24 +812,29 @@ impl Pager {
         }
     }
 
-    /// Runs up to `max_pages` steps of `PRAGMA incremental_vacuum` (SQLite's
+    /// Runs one step of `PRAGMA incremental_vacuum`: moves the last page of
+    /// the database into a free page, or drops it if it is free (SQLite's
     /// `sqlite3BtreeIncrVacuum`, called once per page by `OP_IncrVacuum`).
-    pub fn incremental_vacuum(&self, max_pages: u32) -> IOResultOr<()> {
-        let result = self.incremental_vacuum_steps(max_pages);
+    /// Returns `false` when the freelist is empty.
+    pub fn incremental_vacuum_step(&self) -> IOResultOr<bool> {
+        let result = self.incremental_vacuum_step_states();
         if result.is_err() {
             self.reset_auto_vacuum_state();
         }
         result
     }
 
-    fn incremental_vacuum_steps(&self, max_pages: u32) -> IOResultOr<()> {
+    fn incremental_vacuum_step_states(&self) -> IOResultOr<bool> {
         loop {
             let state = self.vacuum_state.read().auto_vacuum.incremental;
             match state {
                 IncrementalVacuumState::Start => {
-                    let mode = return_if_io!(self.with_header(AutoVacuumMode::from_header));
-                    if mode == AutoVacuumMode::None || max_pages == 0 {
-                        return Ok(IOResult::Done(()));
+                    let (mode, freelist_pages) = return_if_io!(self.with_header(|header| (
+                        AutoVacuumMode::from_header(header),
+                        header.freelist_pages.get()
+                    )));
+                    if mode == AutoVacuumMode::None || freelist_pages == 0 {
+                        return Ok(IOResult::Done(false));
                     }
                     self.vacuum_state.write().auto_vacuum.incremental =
                         IncrementalVacuumState::SyncPtrmap;
@@ -842,11 +847,9 @@ impl Pager {
                 IncrementalVacuumState::SaveCursors => {
                     return_if_io!(self.save_all_cursor_positions());
                     self.vacuum_state.write().auto_vacuum.incremental =
-                        IncrementalVacuumState::Step {
-                            pages_left: max_pages,
-                        };
+                        IncrementalVacuumState::Step;
                 }
-                IncrementalVacuumState::Step { pages_left } => {
+                IncrementalVacuumState::Step => {
                     let (database_size, freelist_pages) = return_if_io!(self.with_header(
                         |header| (header.database_size.get(), header.freelist_pages.get())
                     ));
@@ -858,18 +861,11 @@ impl Pager {
                             "freelist count {freelist_pages} does not fit a database of {database_size} pages"
                         );
                     }
-                    let progressed = pages_left > 0
-                        && freelist_pages > 0
-                        && return_if_io!(self.incr_vacuum_step(final_size, database_size, false));
-                    if !progressed {
-                        self.vacuum_state.write().auto_vacuum.incremental =
-                            IncrementalVacuumState::Start;
-                        return Ok(IOResult::Done(()));
-                    }
+                    let progressed =
+                        return_if_io!(self.incr_vacuum_step(final_size, database_size, false));
                     self.vacuum_state.write().auto_vacuum.incremental =
-                        IncrementalVacuumState::Step {
-                            pages_left: pages_left - 1,
-                        };
+                        IncrementalVacuumState::Start;
+                    return Ok(IOResult::Done(progressed));
                 }
             }
         }
