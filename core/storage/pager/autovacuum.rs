@@ -87,6 +87,14 @@ enum CommitState {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum IncrementalVacuumState {
+    Start,
+    SyncPtrmap,
+    SaveCursors,
+    Step,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum CreateRootState {
     Start,
     SyncPtrmap,
@@ -120,6 +128,7 @@ pub(super) struct AutoVacuumState {
     cursor_save: Option<(Vec<RegisteredCursor>, usize)>,
     incr_step: IncrVacuumStepState,
     commit: CommitState,
+    incremental: IncrementalVacuumState,
     create_root: CreateRootState,
     drop_root: DropRootState,
 }
@@ -131,6 +140,7 @@ impl AutoVacuumState {
             cursor_save: None,
             incr_step: IncrVacuumStepState::Start,
             commit: CommitState::Start,
+            incremental: IncrementalVacuumState::Start,
             create_root: CreateRootState::Start,
             drop_root: DropRootState::Start,
         }
@@ -692,7 +702,23 @@ impl Pager {
         while geometry.is_unmapped_page(new_size) {
             new_size -= 1;
         }
+        // SQLite's pager keeps pages past the end and reuses them when the
+        // file grows again in the same transaction. The page cache does not
+        // take a second page with the same number, so they are dropped here.
+        // A page that existed when the current savepoint was opened goes to
+        // the statement journal first, clean or dirty: if the file grows
+        // again, its number is reused for a new page, and ROLLBACK TO must
+        // bring back what was there.
+        let pending_byte_page = self.pending_byte_page_id();
+        for page_no in new_size + 1..=last_page {
+            if Some(page_no) == pending_byte_page || !self.subjournal_requires_page(page_no) {
+                continue;
+            }
+            let page = return_if_io!(self.read_loaded_page(page_no));
+            self.subjournal_page_if_required(&page)?;
+        }
         return_if_io!(self.with_header_mut(|header| header.database_size = new_size.into()));
+        self.discard_pages_after(new_size)?;
         Ok(IOResult::Done(()))
     }
 
@@ -787,6 +813,65 @@ impl Pager {
                     self.discard_pages_after(database_size)?;
                     self.vacuum_state.write().auto_vacuum.commit = CommitState::Start;
                     return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+
+    /// Runs one step of `PRAGMA incremental_vacuum`: moves the last page of
+    /// the database into a free page, or drops it if it is free (SQLite's
+    /// `sqlite3BtreeIncrVacuum`, called once per page by `OP_IncrVacuum`).
+    /// Returns `false` when the freelist is empty.
+    pub fn incremental_vacuum_step(&self) -> IOResultOr<bool> {
+        let result = self.incremental_vacuum_step_states();
+        if result.is_err() {
+            self.reset_auto_vacuum_state();
+        }
+        result
+    }
+
+    fn incremental_vacuum_step_states(&self) -> IOResultOr<bool> {
+        loop {
+            let state = self.vacuum_state.read().auto_vacuum.incremental;
+            match state {
+                IncrementalVacuumState::Start => {
+                    let (mode, freelist_pages) = return_if_io!(self.with_header(|header| (
+                        auto_vacuum_mode_of(header),
+                        header.freelist_pages.get()
+                    )));
+                    if mode == AutoVacuumMode::None || freelist_pages == 0 {
+                        return Ok(IOResult::Done(false));
+                    }
+                    self.vacuum_state.write().auto_vacuum.incremental =
+                        IncrementalVacuumState::SyncPtrmap;
+                }
+                IncrementalVacuumState::SyncPtrmap => {
+                    return_if_io!(self.ptrmap_sync_dirty_pages());
+                    self.vacuum_state.write().auto_vacuum.incremental =
+                        IncrementalVacuumState::SaveCursors;
+                }
+                IncrementalVacuumState::SaveCursors => {
+                    return_if_io!(self.save_all_cursor_positions());
+                    self.vacuum_state.write().auto_vacuum.incremental =
+                        IncrementalVacuumState::Step;
+                }
+                IncrementalVacuumState::Step => {
+                    let (database_size, freelist_pages) = return_if_io!(self.with_header(
+                        |header| (header.database_size.get(), header.freelist_pages.get())
+                    ));
+                    let final_size = self
+                        .ptrmap_geometry()
+                        .final_db_size(database_size, freelist_pages);
+                    if database_size < final_size || freelist_pages >= database_size {
+                        bail_corrupt_error!(
+                            "freelist count {freelist_pages} does not fit a database of {database_size} pages"
+                        );
+                    }
+                    let progressed =
+                        return_if_io!(self.incr_vacuum_step(final_size, database_size, false));
+                    self.vacuum_state.write().auto_vacuum.incremental =
+                        IncrementalVacuumState::Start;
+                    return Ok(IOResult::Done(progressed));
                 }
             }
         }

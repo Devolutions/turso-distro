@@ -20767,6 +20767,43 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
     }
 }
 
+/// One step of `PRAGMA incremental_vacuum`: moves the last page of an
+/// auto-vacuum database into a free page and shortens the database by one
+/// page, or jumps to `target_pc` when there is no free page (SQLite's
+/// `OP_IncrVacuum`).
+pub fn op_incr_vacuum(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(IncrVacuum { db, target_pc }, insn);
+    if !target_pc.is_offset() {
+        return Err(unresolved_branch_target(*target_pc));
+    }
+    #[cfg_attr(not(feature = "autovacuum"), allow(unused_mut))]
+    let mut progressed = false;
+    if program.connection.mv_store_for_db(*db).is_none() {
+        let vacuum_pager = if *db != MAIN_DB_ID {
+            program.get_pager_from_database_index(db)?
+        } else {
+            pager.clone()
+        };
+        #[cfg(feature = "autovacuum")]
+        {
+            progressed = return_if_io!(state, vacuum_pager.incremental_vacuum_step());
+        }
+        #[cfg(not(feature = "autovacuum"))]
+        let _ = vacuum_pager;
+    }
+    if progressed {
+        state.pc += 1;
+    } else {
+        state.pc = target_pc.as_offset_int();
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// In-place VACUUM - compact the database via target build + direct-WAL
 /// copy-back. The opcode owns the source transaction lifecycle.
 pub fn op_vacuum(

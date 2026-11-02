@@ -2377,6 +2377,13 @@ pub enum Insn {
         dest_reg: usize,
     },
 
+    /// Run one step of `PRAGMA incremental_vacuum` on database `db`, or jump
+    /// to `target_pc` when its freelist is empty.
+    IncrVacuum {
+        db: usize,
+        target_pc: BranchOffset,
+    },
+
     /// In-place VACUUM - compact the database (by writing to a temporary location and then copying
     /// back)
     Vacuum {
@@ -2646,6 +2653,7 @@ impl InsnVariants {
             InsnVariants::HashGraceNextProbe => execute::op_hash_grace_next_probe,
             InsnVariants::HashGraceAdvancePartition => execute::op_hash_grace_advance_partition,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
+            InsnVariants::IncrVacuum => execute::op_incr_vacuum,
             InsnVariants::Vacuum => execute::op_vacuum,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }
@@ -2715,6 +2723,7 @@ impl Insn {
             | Self::AddColumn { .. }
             | Self::AlterColumn { .. }
             | Self::JournalMode { .. }
+            | Self::IncrVacuum { .. }
             | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,
             // A recursive foreign-key action is treated as writable while it's still being

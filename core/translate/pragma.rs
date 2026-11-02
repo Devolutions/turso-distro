@@ -288,6 +288,7 @@ pub fn translate_pragma(
             | PragmaName::TableXinfo
             | PragmaName::IntegrityCheck
             | PragmaName::DatabaseList
+            | PragmaName::IncrementalVacuum
             | PragmaName::QuickCheck => query_pragma(
                 pragma,
                 resolver,
@@ -660,6 +661,7 @@ fn update_pragma(
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
+        PragmaName::IncrementalVacuum => unreachable!("incremental_vacuum is not a setting"),
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
             let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
@@ -891,6 +893,35 @@ fn query_pragma(
     let schema = resolver.schema();
     let register = program.alloc_register();
     match pragma {
+        PragmaName::IncrementalVacuum => {
+            // Like SQLite, a missing, non-positive or out-of-range page count
+            // vacuums every free page.
+            let max_pages = match value.as_ref().map(parse_signed_number) {
+                Some(Ok(Value::Numeric(Numeric::Integer(n)))) if n > 0 && n <= i32::MAX as i64 => n,
+                _ => i32::MAX as i64,
+            };
+            // As in SQLite, each page moved returns a row with no columns.
+            program.emit_int(max_pages, register);
+            let step = program.allocate_label();
+            let done = program.allocate_label();
+            program.preassign_label_to_next_insn(step);
+            program.emit_insn(Insn::IncrVacuum {
+                db: database_id,
+                target_pc: done,
+            });
+            program.emit_result_row(register, 0);
+            program.emit_insn(Insn::AddImm {
+                register,
+                value: -1,
+            });
+            program.emit_insn(Insn::IfPos {
+                reg: register,
+                target_pc: step,
+                decrement_by: 0,
+            });
+            program.preassign_label_to_next_insn(done);
+            Ok(TransactionMode::Write)
+        }
         PragmaName::ApplicationId => {
             program.emit_insn(Insn::ReadCookie {
                 db: database_id,

@@ -2876,6 +2876,15 @@ pub fn insn_to_row(
             0,
             format!("schema={schema_name}, dest=r[{dest_reg}]"),
         ),
+        Insn::IncrVacuum { db, target_pc } => (
+            "IncrVacuum",
+            *db as i64,
+            target_pc.as_debug_int() as i64,
+            0,
+            Value::Null,
+            0,
+            format!("if db={db} has no free pages goto {}", target_pc.as_debug_int()),
+        ),
         Insn::Vacuum { db } => (
             "Vacuum",
             *db as i64,

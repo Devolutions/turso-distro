@@ -143,6 +143,8 @@ fn run_in_turso(path: &Path, statements: &[&str]) {
     conn.close().unwrap();
 }
 
+/// Steps every statement to completion: `PRAGMA incremental_vacuum` moves
+/// one page per row it returns.
 fn run_in_sqlite(path: &Path, statements: &[&str]) {
     let conn = rusqlite::Connection::open(path).unwrap();
     for statement in statements {
@@ -306,6 +308,146 @@ fn test_autovacuum_drop_table_keeps_sqlite_schema_in_rowid_order() {
         "DROP TABLE t4",
         "INSERT INTO t7 VALUES (1, 'x')",
     ]);
+}
+
+#[test]
+fn test_autovacuum_incremental_vacuum_matches_sqlite() {
+    assert_same_file_as_sqlite(&[
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 300) SELECT zeroblob(800) FROM s",
+        "DELETE FROM t WHERE a % 2 = 0",
+        "PRAGMA incremental_vacuum(10)",
+        "PRAGMA incremental_vacuum(0)",
+    ]);
+}
+
+/// Steps `PRAGMA incremental_vacuum` with Turso, reading the table on the
+/// same connection after every row. Returns the number of rows.
+fn incremental_vacuum_in_turso(path: &Path, pragma: &str, check: &str) -> usize {
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let db = TempDatabase::new_with_existent_with_opts(path, opts);
+    let conn = db.connect_limbo();
+    let expected = crate::common::limbo_exec_rows(&conn, check);
+    let mut stmt = conn.prepare(pragma).unwrap();
+    let mut rows = 0;
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                assert_eq!(stmt.row().unwrap().get_values().count(), 0);
+                rows += 1;
+                assert_eq!(crate::common::limbo_exec_rows(&conn, check), expected);
+            }
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            other => panic!("{pragma}: unexpected {other:?}"),
+        }
+    }
+    drop(stmt);
+    conn.close().unwrap();
+    rows
+}
+
+fn incremental_vacuum_in_sqlite(path: &Path, pragma: &str) -> usize {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let mut stmt = conn.prepare(pragma).unwrap();
+    let mut result = stmt.raw_query();
+    let mut rows = 0;
+    while result.next().unwrap().is_some() {
+        rows += 1;
+    }
+    rows
+}
+
+/// SQLite returns one row without columns for each page that
+/// `PRAGMA incremental_vacuum` moves or frees (incrvacuum.test 7.* counts
+/// them), and the connection can read between those rows.
+#[test]
+fn test_autovacuum_incremental_vacuum_returns_a_row_per_page() {
+    for journal_mode in ["WAL", "DELETE"] {
+        for pragma in [
+            "PRAGMA incremental_vacuum(5)",
+            "PRAGMA incremental_vacuum",
+            "PRAGMA incremental_vacuum(-1)",
+        ] {
+            let dir = TempDir::new().unwrap();
+            let by_sqlite =
+                create_sqlite_database(dir.path(), "sqlite.db", "INCREMENTAL", journal_mode);
+            run_in_sqlite(
+                &by_sqlite,
+                &[
+                    "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)",
+                    "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 100) SELECT zeroblob(800) FROM s",
+                    "DELETE FROM t WHERE a % 3 <> 0",
+                ],
+            );
+            let by_turso = dir.path().join("turso.db");
+            std::fs::copy(&by_sqlite, &by_turso).unwrap();
+            let expected_rows = incremental_vacuum_in_sqlite(&by_sqlite, pragma);
+            let rows = incremental_vacuum_in_turso(
+                &by_turso,
+                pragma,
+                "SELECT count(*), sum(length(b)), group_concat(a) FROM t",
+            );
+            let context = format!("journal_mode={journal_mode}, {pragma}");
+            assert!(expected_rows > 0, "{context}");
+            assert_eq!(rows, expected_rows, "{context}");
+            assert_eq!(sqlite_view(&by_turso), sqlite_view(&by_sqlite), "{context}");
+        }
+    }
+}
+
+#[test]
+fn test_autovacuum_incremental_vacuum_then_growth_in_one_transaction() {
+    assert_same_file_as_sqlite(&[
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 300) SELECT zeroblob(800) FROM s",
+        "BEGIN",
+        "DELETE FROM t WHERE a % 2 = 0",
+        "PRAGMA incremental_vacuum",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 200) SELECT zeroblob(800) FROM s",
+        "COMMIT",
+    ]);
+}
+
+#[test]
+fn test_autovacuum_rollback_to_savepoint_restores_pages_cut_by_incremental_vacuum() {
+    assert_same_file_as_sqlite(&[
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 300) SELECT zeroblob(800) FROM s",
+        "BEGIN",
+        "UPDATE t SET b = zeroblob(790)",
+        "DELETE FROM t WHERE a % 2 = 0",
+        "SAVEPOINT s",
+        "PRAGMA incremental_vacuum",
+        "ROLLBACK TO s",
+        "INSERT INTO t(b) VALUES (zeroblob(800))",
+        "COMMIT",
+    ]);
+}
+
+/// Pages cut by `PRAGMA incremental_vacuum` and reused when the file grows
+/// again must come back as they were on `ROLLBACK TO` (savepoint6.test).
+#[test]
+fn test_autovacuum_rollback_to_savepoint_restores_pages_cut_and_reused() {
+    for nested in [false, true] {
+        let mut statements = vec![
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE)",
+            "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 300) SELECT hex(zeroblob(200)) || value FROM s",
+            "DELETE FROM t WHERE a % 3 = 0",
+            "SAVEPOINT a",
+            "PRAGMA incremental_vacuum",
+        ];
+        if nested {
+            statements.extend(["SAVEPOINT b", "RELEASE b"]);
+        }
+        statements.extend([
+            "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 150) SELECT hex(zeroblob(300)) || value FROM s",
+            "ROLLBACK TO a",
+            "INSERT INTO t(b) VALUES ('after')",
+            "RELEASE a",
+        ]);
+        assert_same_file_as_sqlite(&statements);
+    }
 }
 
 #[test]
