@@ -2219,26 +2219,31 @@ impl Pager {
     ///
     /// A buffer of length page_size + 4 bytes is allocated and the page id
     /// is written to the beginning of the buffer. The rest of the buffer is filled with the page contents.
-    pub fn subjournal_page_if_required(&self, page: &Page) -> Result<()> {
+    /// Whether a change to page `page_id` must first save the page to the
+    /// statement journal for the current savepoint.
+    pub fn subjournal_requires_page(&self, page_id: u32) -> bool {
         if self.subjournal.read().is_none() {
+            return false;
+        }
+        let savepoints = self.savepoints.read();
+        let Some(cur_savepoint) = savepoints.last() else {
+            return false;
+        };
+        // Skip subjournaling for pages that didn't exist when the savepoint was opened.
+        // New pages (allocated during this statement) can be "rolled back" by simply
+        // truncating back to the original db_size. This matches SQLite's subjRequiresPage()
+        // which checks: p->nOrig >= pgno.
+        page_id <= cur_savepoint.db_size.load(Ordering::Acquire)
+            && !cur_savepoint.has_dirty_page(page_id)
+    }
+
+    pub fn subjournal_page_if_required(&self, page: &Page) -> Result<()> {
+        if !self.subjournal_requires_page(page.get().id() as u32) {
             return Ok(());
         }
         let write_offset = {
             let savepoints = self.savepoints.read();
-            let Some(cur_savepoint) = savepoints.last() else {
-                return Ok(());
-            };
-            // Skip subjournaling for pages that didn't exist when the savepoint was opened.
-            // New pages (allocated during this statement) can be "rolled back" by simply
-            // truncating back to the original db_size. This matches SQLite's subjRequiresPage()
-            // which checks: p->nOrig >= pgno.
-            let page_id_u32 = page.get().id() as u32;
-            if page_id_u32 > cur_savepoint.db_size.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            if cur_savepoint.has_dirty_page(page_id_u32) {
-                return Ok(());
-            }
+            let cur_savepoint = savepoints.last().expect("savepoint must be open");
             cur_savepoint.write_offset.load(Ordering::SeqCst)
         };
         let page_id = page.get().id();

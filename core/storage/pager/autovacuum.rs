@@ -696,7 +696,23 @@ impl Pager {
         while geometry.is_unmapped_page(new_size) {
             new_size -= 1;
         }
+        // SQLite's pager keeps pages past the end and reuses them when the
+        // file grows again in the same transaction. The page cache does not
+        // take a second page with the same number, so they are dropped here.
+        // A page that existed when the current savepoint was opened goes to
+        // the statement journal first, clean or dirty: if the file grows
+        // again, its number is reused for a new page, and ROLLBACK TO must
+        // bring back what was there.
+        let pending_byte_page = self.pending_byte_page_id();
+        for page_no in new_size + 1..=last_page {
+            if Some(page_no) == pending_byte_page || !self.subjournal_requires_page(page_no) {
+                continue;
+            }
+            let page = return_if_io!(self.read_loaded_page(page_no));
+            self.subjournal_page_if_required(&page)?;
+        }
         return_if_io!(self.with_header_mut(|header| header.database_size = new_size.into()));
+        self.discard_pages_after(new_size)?;
         Ok(IOResult::Done(()))
     }
 

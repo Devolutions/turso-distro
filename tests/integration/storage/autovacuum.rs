@@ -322,6 +322,60 @@ fn test_autovacuum_incremental_vacuum_matches_sqlite() {
 }
 
 #[test]
+fn test_autovacuum_incremental_vacuum_then_growth_in_one_transaction() {
+    assert_same_file_as_sqlite(&[
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 300) SELECT zeroblob(800) FROM s",
+        "BEGIN",
+        "DELETE FROM t WHERE a % 2 = 0",
+        "PRAGMA incremental_vacuum",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 200) SELECT zeroblob(800) FROM s",
+        "COMMIT",
+    ]);
+}
+
+#[test]
+fn test_autovacuum_rollback_to_savepoint_restores_pages_cut_by_incremental_vacuum() {
+    assert_same_file_as_sqlite(&[
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 300) SELECT zeroblob(800) FROM s",
+        "BEGIN",
+        "UPDATE t SET b = zeroblob(790)",
+        "DELETE FROM t WHERE a % 2 = 0",
+        "SAVEPOINT s",
+        "PRAGMA incremental_vacuum",
+        "ROLLBACK TO s",
+        "INSERT INTO t(b) VALUES (zeroblob(800))",
+        "COMMIT",
+    ]);
+}
+
+/// Pages cut by `PRAGMA incremental_vacuum` and reused when the file grows
+/// again must come back as they were on `ROLLBACK TO` (savepoint6.test).
+#[test]
+fn test_autovacuum_rollback_to_savepoint_restores_pages_cut_and_reused() {
+    for nested in [false, true] {
+        let mut statements = vec![
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE)",
+            "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 300) SELECT hex(zeroblob(200)) || value FROM s",
+            "DELETE FROM t WHERE a % 3 = 0",
+            "SAVEPOINT a",
+            "PRAGMA incremental_vacuum",
+        ];
+        if nested {
+            statements.extend(["SAVEPOINT b", "RELEASE b"]);
+        }
+        statements.extend([
+            "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 150) SELECT hex(zeroblob(300)) || value FROM s",
+            "ROLLBACK TO a",
+            "INSERT INTO t(b) VALUES ('after')",
+            "RELEASE a",
+        ]);
+        assert_same_file_as_sqlite(&statements);
+    }
+}
+
+#[test]
 fn test_autovacuum_statement_rollback_keeps_pointer_map() {
     assert_same_file_as_sqlite(&[
         "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE)",
