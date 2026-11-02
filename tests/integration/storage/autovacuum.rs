@@ -335,3 +335,27 @@ fn test_autovacuum_statement_rollback_keeps_pointer_map() {
         "COMMIT",
     ]);
 }
+
+/// The pager moves the largest root page when it creates and drops b-trees;
+/// an MVCC checkpoint must not put back the value its logical header had.
+#[test]
+fn test_mvcc_checkpoint_keeps_the_largest_root_page() {
+    let dir = TempDir::new().unwrap();
+    let path = create_sqlite_database(dir.path(), "mvcc.db", "FULL", "WAL");
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE a(x)").unwrap();
+    conn.execute("CREATE TABLE b(x)").unwrap();
+    conn.execute("CREATE INDEX b_x ON b(x)").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let rows: Vec<(i64,)> =
+        crate::common::ExecRows::exec_rows(&conn, "SELECT max(rootpage) FROM sqlite_schema");
+    conn.close().unwrap();
+    drop(db);
+
+    let header = std::fs::read(&path).unwrap();
+    let largest_root_page = u32::from_be_bytes(header[52..56].try_into().unwrap());
+    assert_eq!(largest_root_page as i64, rows[0].0);
+}

@@ -3203,14 +3203,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             self.database.schema.lock().schema_version.into();
                         let staged_header = self.pager.io.block(|| {
                             self.pager.with_header_mut(|header| {
-                                // Keep pager-maintained fields (for example database_size/change_counter)
-                                // intact, and apply only MVCC header mutations that are authored via
-                                // SetCookie/PRAGMA paths.
+                                // Keep pager-maintained fields (for example database_size/change_counter
+                                // and the largest root page, which auto-vacuum moves) intact, and apply
+                                // only MVCC header mutations that are authored via SetCookie/PRAGMA paths.
                                 header.schema_cookie = checkpoint_header.schema_cookie;
                                 header.user_version = checkpoint_header.user_version;
                                 header.application_id = checkpoint_header.application_id;
-                                header.vacuum_mode_largest_root_page =
-                                    checkpoint_header.vacuum_mode_largest_root_page;
                                 header.incremental_vacuum_enabled =
                                     checkpoint_header.incremental_vacuum_enabled;
                                 *header
