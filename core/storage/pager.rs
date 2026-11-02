@@ -1424,6 +1424,20 @@ impl From<u8> for AutoVacuumMode {
     }
 }
 
+impl AutoVacuumMode {
+    pub fn from_header(header: &DatabaseHeader) -> Self {
+        if header.vacuum_mode_largest_root_page.get() == 0 {
+            AutoVacuumMode::None
+        } else if header.incremental_vacuum_enabled.get() != 0 {
+            AutoVacuumMode::Incremental
+        } else {
+            AutoVacuumMode::Full
+        }
+    }
+}
+
+const NO_REQUESTED_AUTO_VACUUM_MODE: u8 = u8::MAX;
+
 const fn auto_vacuum_header_fields(mode: AutoVacuumMode) -> (u32, u32) {
     match mode {
         AutoVacuumMode::None => (0, 0),
@@ -1628,7 +1642,10 @@ pub struct Pager {
     commit_info: RwLock<CommitInfo>,
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
-    auto_vacuum_mode: AtomicU8,
+    /// The auto-vacuum mode last set with `PRAGMA auto_vacuum`, which the
+    /// next VACUUM gives the database (SQLite's `db->nextAutovac`).
+    /// [NO_REQUESTED_AUTO_VACUUM_MODE] when the pragma was not used.
+    requested_auto_vacuum_mode: AtomicU8,
     /// The state of the current allocate page operation.
     allocate_page_state: RwLock<AllocatePageState>,
     /// The state of the current allocate page1 operation.
@@ -1955,7 +1972,7 @@ impl Pager {
             syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_state: RwLock::new(CheckpointState::default()),
             buffer_pool,
-            auto_vacuum_mode: AtomicU8::new(AutoVacuumMode::None.into()),
+            requested_auto_vacuum_mode: AtomicU8::new(NO_REQUESTED_AUTO_VACUUM_MODE),
             allocate_page1_state,
             reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
             schema_cookie: AtomicU64::new(Self::SCHEMA_COOKIE_NOT_SET),
@@ -2686,12 +2703,16 @@ impl Pager {
         self.wal = Some(wal);
     }
 
-    pub fn get_auto_vacuum_mode(&self) -> AutoVacuumMode {
-        self.auto_vacuum_mode.load(Ordering::SeqCst).into()
+    pub fn requested_auto_vacuum_mode(&self) -> Option<AutoVacuumMode> {
+        match self.requested_auto_vacuum_mode.load(Ordering::SeqCst) {
+            NO_REQUESTED_AUTO_VACUUM_MODE => None,
+            mode => Some(mode.into()),
+        }
     }
 
-    pub fn set_auto_vacuum_mode(&self, mode: AutoVacuumMode) {
-        self.auto_vacuum_mode.store(mode.into(), Ordering::SeqCst);
+    pub fn set_requested_auto_vacuum_mode(&self, mode: AutoVacuumMode) {
+        self.requested_auto_vacuum_mode
+            .store(mode.into(), Ordering::SeqCst);
     }
 
     /// Persist the auto-vacuum mode to page 1 and keep the pager cache in sync.
@@ -2717,8 +2738,6 @@ impl Pager {
             // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
             self.dirty_pages.write().clear();
         }
-
-        self.set_auto_vacuum_mode(mode);
         Ok(())
     }
 
@@ -2739,7 +2758,7 @@ impl Pager {
 
         #[cfg(feature = "autovacuum")]
         {
-            let mode = return_if_io!(self.with_header(autovacuum::auto_vacuum_mode_of));
+            let mode = return_if_io!(self.with_header(AutoVacuumMode::from_header));
             if mode == AutoVacuumMode::None {
                 let page =
                     return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
@@ -5377,7 +5396,7 @@ impl Pager {
                         // Unpin page before finishing - it's added to freelist
                         page.unpin();
                         #[cfg(feature = "autovacuum")]
-                        if autovacuum::auto_vacuum_mode_of(header) != AutoVacuumMode::None {
+                        if AutoVacuumMode::from_header(header) != AutoVacuumMode::None {
                             *state = FreePageState::RecordInPtrmap;
                             continue;
                         }
@@ -5405,7 +5424,7 @@ impl Pager {
                     // Unpin page before finishing - it's now a trunk page
                     page.unpin();
                     #[cfg(feature = "autovacuum")]
-                    if autovacuum::auto_vacuum_mode_of(header) != AutoVacuumMode::None {
+                    if AutoVacuumMode::from_header(header) != AutoVacuumMode::None {
                         *state = FreePageState::RecordInPtrmap;
                         continue;
                     }
@@ -5660,7 +5679,7 @@ impl Pager {
                     trunk_page.unpin();
                     let trunk_page = trunk_page.clone();
                     #[cfg(feature = "autovacuum")]
-                    if autovacuum::auto_vacuum_mode_of(header) != AutoVacuumMode::None {
+                    if AutoVacuumMode::from_header(header) != AutoVacuumMode::None {
                         *state = AllocatePageState::RecordInPtrmap { page: trunk_page };
                         continue;
                     }
@@ -5725,7 +5744,7 @@ impl Pager {
                     leaf_page.unpin();
                     let leaf_page = leaf_page.clone();
                     #[cfg(feature = "autovacuum")]
-                    if autovacuum::auto_vacuum_mode_of(header) != AutoVacuumMode::None {
+                    if AutoVacuumMode::from_header(header) != AutoVacuumMode::None {
                         *state = AllocatePageState::RecordInPtrmap { page: leaf_page };
                         continue;
                     }
@@ -5741,7 +5760,7 @@ impl Pager {
                     #[cfg(feature = "autovacuum")]
                     let mut ptrmap_page_id = None;
                     #[cfg(feature = "autovacuum")]
-                    if autovacuum::auto_vacuum_mode_of(header) != AutoVacuumMode::None
+                    if AutoVacuumMode::from_header(header) != AutoVacuumMode::None
                         && self.ptrmap_geometry().is_ptrmap_page(new_db_size)
                     {
                         ptrmap_page_id = Some(new_db_size);
@@ -5792,7 +5811,7 @@ impl Pager {
                             .force_insert_page(page_key, page.clone())?;
                         header.database_size = new_db_size.into();
                         #[cfg(feature = "autovacuum")]
-                        if autovacuum::auto_vacuum_mode_of(header) != AutoVacuumMode::None {
+                        if AutoVacuumMode::from_header(header) != AutoVacuumMode::None {
                             *state = AllocatePageState::RecordInPtrmap { page };
                             continue;
                         }
@@ -6701,7 +6720,13 @@ mod ptrmap_tests {
 
         assert_eq!(largest_root_page, 1);
         assert_eq!(incremental_vacuum_enabled, 1);
-        assert_eq!(pager.get_auto_vacuum_mode(), AutoVacuumMode::Incremental);
+        assert_eq!(
+            pager
+                .io
+                .block(|| pager.with_header(AutoVacuumMode::from_header))
+                .unwrap(),
+            AutoVacuumMode::Incremental
+        );
         assert!(
             pager.dirty_pages.read().is_empty(),
             "fresh-db auto-vacuum setup must not leave dirty pages behind"

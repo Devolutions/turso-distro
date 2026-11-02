@@ -26,7 +26,7 @@ use crate::storage::database::DatabaseFile;
 use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{
-    default_page1, CreateBTreeFlags, PageRef, SavepointResult, SharedPagerState,
+    default_page1, AutoVacuumMode, CreateBTreeFlags, PageRef, SavepointResult, SharedPagerState,
 };
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
@@ -170,9 +170,8 @@ use turso_parser::parser::Parser;
 
 use super::sorter::Sorter;
 use crate::vdbe::vacuum::{
-    capture_custom_types, mirror_symbols, reject_unsupported_vacuum_auto_vacuum_mode,
-    vacuum_target_build_step, vacuum_target_opts_from_source, VacuumDbHeaderMeta,
-    VacuumTargetBuildConfig, VacuumTargetBuildContext,
+    capture_custom_types, mirror_symbols, vacuum_target_build_step, vacuum_target_opts_from_source,
+    VacuumDbHeaderMeta, VacuumTargetBuildConfig, VacuumTargetBuildContext,
 };
 
 #[cfg(feature = "json")]
@@ -16634,7 +16633,7 @@ pub fn op_read_cookie(
                 Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
                 Cookie::PageSize => header.page_size.get().into(),
                 Cookie::FreePageCount => header.freelist_pages.get().into(),
-                cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
+                Cookie::IncrementalVacuum => header.incremental_vacuum_enabled.get().into(),
             },
         ) {
             Err(_) => 0.into(),
@@ -17538,18 +17537,22 @@ pub fn op_integrity_check(
         .filter(|mv_store| !mv_store.uses_passive_checkpoint());
     match state.active_op_state.integrity_check() {
         OpIntegrityCheckState::Start => {
-            let (freelist_trunk_page, db_size) = return_if_io!(
+            let (freelist_trunk_page, db_size, auto_vacuum) = return_if_io!(
                 state,
                 with_header(
                     &target_pager,
                     physical_header_store,
                     program,
                     *db,
-                    |header| (header.freelist_trunk_page.get(), header.database_size.get())
+                    |header| (
+                        header.freelist_trunk_page.get(),
+                        header.database_size.get(),
+                        AutoVacuumMode::from_header(header) != AutoVacuumMode::None
+                    )
                 )
             );
             let mut errors: crate::alloc::Vec<_> = crate::alloc::vec![];
-            let mut integrity_check_state = IntegrityCheckState::new(db_size as usize);
+            let mut integrity_check_state = IntegrityCheckState::new(db_size as usize, auto_vacuum);
             let mut current_root_idx = 0;
 
             if freelist_trunk_page > 0 {
@@ -17645,13 +17648,7 @@ pub fn op_integrity_check(
                 )?;
             }
 
-            #[cfg(feature = "autovacuum")]
-            let skip_page_never_used = !matches!(
-                target_pager.get_auto_vacuum_mode(),
-                crate::storage::pager::AutoVacuumMode::None
-            );
-            #[cfg(not(feature = "autovacuum"))]
-            let skip_page_never_used = false;
+            let skip_page_never_used = integrity_check_state.auto_vacuum;
 
             if !skip_page_never_used {
                 for page_number in 2..=integrity_check_state.db_size {
@@ -20606,8 +20603,6 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 let source_pager = program
                     .connection
                     .get_pager_from_database_index(&source_db_id)?;
-                let source_auto_vacuum_mode = source_pager.get_auto_vacuum_mode();
-                reject_unsupported_vacuum_auto_vacuum_mode(source_auto_vacuum_mode)?;
                 let header_meta = if let Some(mv_store) =
                     program.connection.mv_store_for_db(source_db_id)
                 {
@@ -20711,7 +20706,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     header_meta,
                     source_custom_types,
                     target_mvcc_enabled: source_db.mvcc_enabled(),
-                    target_auto_vacuum_mode: source_auto_vacuum_mode,
+                    target_auto_vacuum_mode: header_meta.target_auto_vacuum_mode(&source_pager),
                     copy_mvcc_metadata_table: false,
                 };
 

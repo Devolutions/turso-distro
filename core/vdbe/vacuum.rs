@@ -220,15 +220,6 @@ pub(crate) fn vacuum_target_opts_from_source(source_db: &Database) -> DatabaseOp
         .with_without_rowid(source_db.experimental_without_rowid_enabled())
 }
 
-pub(crate) fn reject_unsupported_vacuum_auto_vacuum_mode(mode: AutoVacuumMode) -> Result<()> {
-    if matches!(mode, AutoVacuumMode::Incremental) {
-        return Err(LimboError::InternalError(
-            "Incremental auto-vacuum is not supported".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 /// Database header metadata that the target build must finalize before commit.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct VacuumDbHeaderMeta {
@@ -239,9 +230,18 @@ pub(crate) struct VacuumDbHeaderMeta {
     text_encoding: TextEncoding,
     user_version: i32,
     application_id: i32,
+    auto_vacuum_mode: AutoVacuumMode,
 }
 
 impl VacuumDbHeaderMeta {
+    /// The auto-vacuum mode of the vacuumed database: the one last set with
+    /// `PRAGMA auto_vacuum`, else the source's (SQLite's `db->nextAutovac`).
+    pub(crate) fn target_auto_vacuum_mode(&self, source_pager: &Pager) -> AutoVacuumMode {
+        source_pager
+            .requested_auto_vacuum_mode()
+            .unwrap_or(self.auto_vacuum_mode)
+    }
+
     pub(crate) fn from_source_header(source: &DatabaseHeader) -> Self {
         Self {
             read_version: source.read_version,
@@ -251,6 +251,7 @@ impl VacuumDbHeaderMeta {
             text_encoding: source.text_encoding,
             user_version: source.user_version.get(),
             application_id: source.application_id.get(),
+            auto_vacuum_mode: AutoVacuumMode::from_header(source),
         }
     }
 
@@ -1901,7 +1902,6 @@ fn vacuum_in_place_step(
                     )
                     .into());
                 }
-                reject_unsupported_vacuum_auto_vacuum_mode(source_pager.get_auto_vacuum_mode())?;
                 // 6. Reject non-WAL pagers.
                 let wal = source_pager.wal.as_ref().ok_or_else(|| {
                     LimboError::InternalError("VACUUM requires a WAL-mode database".to_string())
@@ -2023,7 +2023,7 @@ fn vacuum_in_place_step(
                     header_meta,
                     source_custom_types,
                     target_mvcc_enabled: false,
-                    target_auto_vacuum_mode: source_pager.get_auto_vacuum_mode(),
+                    target_auto_vacuum_mode: header_meta.target_auto_vacuum_mode(&source_pager),
                     copy_mvcc_metadata_table: source_db.mvcc_enabled(),
                 };
 
@@ -2890,7 +2890,9 @@ mod tests {
             text_encoding,
             user_version,
             application_id,
+            auto_vacuum_mode,
         } = VacuumDbHeaderMeta::from_source_header(&source);
+        assert_eq!(auto_vacuum_mode, AutoVacuumMode::None);
 
         assert_eq!(read_version, source.read_version);
         assert_eq!(write_version, source.write_version);
@@ -3040,6 +3042,7 @@ mod tests {
             text_encoding: TextEncoding::Utf8,
             user_version: 17,
             application_id: 29,
+            auto_vacuum_mode: AutoVacuumMode::None,
         };
         match finalize_vacuum_target_header(&temp.conn, &header_meta)? {
             crate::IOResult::Done(()) => {}
@@ -3172,7 +3175,7 @@ mod tests {
             header_meta,
             source_custom_types: capture_custom_types(&source_conn, crate::MAIN_DB_ID),
             target_mvcc_enabled: source_db.mvcc_enabled(),
-            target_auto_vacuum_mode: source_pager.get_auto_vacuum_mode(),
+            target_auto_vacuum_mode: header_meta.target_auto_vacuum_mode(&source_pager),
             copy_mvcc_metadata_table: false,
         };
 
