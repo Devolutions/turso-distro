@@ -1,3 +1,5 @@
+#[cfg(feature = "autovacuum")]
+use crate::storage::pager::ptrmap::{PtrmapEntry, PtrmapType};
 use crate::types::IOResultOr;
 use branches::{mark_unlikely, unlikely};
 use rustc_hash::FxHashMap as HashMap;
@@ -8268,6 +8270,27 @@ pub enum IntegrityCheckError {
     FreelistPointerOutOfRange { page_id: i64, pointer: i64 },
     #[error("overflow list length is {got} but should be {expected}")]
     OverflowListLengthMismatch { got: usize, expected: usize },
+    #[error("Failed to read ptrmap key={page_id}")]
+    PtrmapEntryUnreadable { page_id: i64 },
+    #[error("Bad ptr map entry key={page_id} expected=({expected_type},{expected_parent}) got=({actual_type},{actual_parent})")]
+    PtrmapEntryMismatch {
+        page_id: i64,
+        expected_type: u8,
+        expected_parent: u32,
+        actual_type: u8,
+        actual_parent: u32,
+    },
+    #[error(
+        "max rootpage ({largest_root_page}) disagrees with header ({header_largest_root_page})"
+    )]
+    LargestRootPageMismatch {
+        largest_root_page: i64,
+        header_largest_root_page: u32,
+    },
+    #[error("incremental_vacuum enabled with a max rootpage of zero")]
+    IncrementalVacuumWithoutLargestRootPage,
+    #[error("Page {page_id}: pointer map referenced")]
+    PtrmapPageReferenced { page_id: i64 },
 }
 
 fn push_integrity_error(
@@ -8310,6 +8333,16 @@ pub struct IntegrityCheckState {
     pub freelist_count: CheckFreelist,
     /// The database has auto-vacuum, so pointer-map pages are never referenced.
     pub auto_vacuum: bool,
+    /// The pointer-map entry that every page reached so far must have, and
+    /// how many of them were already checked (SQLite's checkPtrmap).
+    #[cfg(feature = "autovacuum")]
+    pub expected_ptrmap_entries: crate::alloc::Vec<(u32, PtrmapEntry)>,
+    #[cfg(feature = "autovacuum")]
+    pub checked_ptrmap_entries: usize,
+    /// Overflow pages reached so far, to tell first overflow pages from the
+    /// ones that follow another overflow page.
+    #[cfg(feature = "autovacuum")]
+    overflow_pages: crate::HashSet<i64>,
 }
 
 impl IntegrityCheckState {
@@ -8318,6 +8351,12 @@ impl IntegrityCheckState {
             page_stack: crate::alloc::vec![],
             db_size,
             auto_vacuum,
+            #[cfg(feature = "autovacuum")]
+            expected_ptrmap_entries: crate::alloc::vec![],
+            #[cfg(feature = "autovacuum")]
+            checked_ptrmap_entries: 0,
+            #[cfg(feature = "autovacuum")]
+            overflow_pages: crate::HashSet::default(),
             page_reference: HashMap::default(),
             first_leaf_level: None,
             page: None,
@@ -8368,6 +8407,10 @@ impl IntegrityCheckState {
     ) -> Result<()> {
         let page_id = entry.page_idx;
         let Some(previous) = self.page_reference.get(&page_id).copied() else {
+            #[cfg(feature = "autovacuum")]
+            if self.auto_vacuum && page_id > 1 {
+                self.expect_ptrmap_entry(page_id, entry.page_category, referenced_by)?;
+            }
             crate::with_btree_allocation_site!(IntegrityCheck, self.page_stack.try_reserve(1))?;
             let previous = self.page_reference.insert(page_id, referenced_by);
             turso_assert!(
@@ -8390,6 +8433,39 @@ impl IntegrityCheckState {
                 page_category: entry.page_category,
                 references,
             },
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "autovacuum")]
+    fn expect_ptrmap_entry(
+        &mut self,
+        page_id: i64,
+        page_category: PageCategory,
+        referenced_by: i64,
+    ) -> Result<()> {
+        let (entry_type, parent_page_no) = match page_category {
+            PageCategory::Normal if referenced_by == 0 => (PtrmapType::RootPage, 0),
+            PageCategory::Normal => (PtrmapType::BTreeNode, referenced_by),
+            PageCategory::Overflow => {
+                self.overflow_pages.insert(page_id);
+                if self.overflow_pages.contains(&referenced_by) {
+                    (PtrmapType::Overflow2, referenced_by)
+                } else {
+                    (PtrmapType::Overflow1, referenced_by)
+                }
+            }
+            PageCategory::FreeListTrunk | PageCategory::FreePage => (PtrmapType::FreePage, 0),
+        };
+        crate::with_btree_allocation_site!(
+            IntegrityCheck,
+            self.expected_ptrmap_entries.try_push((
+                page_id as u32,
+                PtrmapEntry {
+                    entry_type,
+                    parent_page_no: parent_page_no as u32,
+                },
+            ))
         )?;
         Ok(())
     }

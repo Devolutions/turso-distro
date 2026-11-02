@@ -26,7 +26,7 @@ use crate::storage::database::DatabaseFile;
 use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{
-    default_page1, AutoVacuumMode, CreateBTreeFlags, PageRef, SavepointResult, SharedPagerState,
+    default_page1, CreateBTreeFlags, PageRef, SavepointResult, SharedPagerState,
 };
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
@@ -17505,7 +17505,7 @@ pub enum OpIntegrityCheckState {
         errors: crate::alloc::Vec<IntegrityCheckError>,
         current_root_idx: usize,
         current_dropped_idx: usize,
-        state: IntegrityCheckState,
+        state: Box<IntegrityCheckState>,
     },
 }
 
@@ -17537,7 +17537,7 @@ pub fn op_integrity_check(
         .filter(|mv_store| !mv_store.uses_passive_checkpoint());
     match state.active_op_state.integrity_check() {
         OpIntegrityCheckState::Start => {
-            let (freelist_trunk_page, db_size, auto_vacuum) = return_if_io!(
+            let (freelist_trunk_page, db_size, largest_root_page, incremental_vacuum) = return_if_io!(
                 state,
                 with_header(
                     &target_pager,
@@ -17547,11 +17547,36 @@ pub fn op_integrity_check(
                     |header| (
                         header.freelist_trunk_page.get(),
                         header.database_size.get(),
-                        AutoVacuumMode::from_header(header) != AutoVacuumMode::None
+                        header.vacuum_mode_largest_root_page.get(),
+                        header.incremental_vacuum_enabled.get()
                     )
                 )
             );
+            let auto_vacuum = largest_root_page != 0;
+            // Changes of the current write transaction may not be in the
+            // pointer map yet.
+            #[cfg(feature = "autovacuum")]
+            if auto_vacuum && mv_store.is_none() {
+                return_if_io!(state, target_pager.ptrmap_sync_dirty_pages());
+            }
             let mut errors: crate::alloc::Vec<_> = crate::alloc::vec![];
+            if auto_vacuum {
+                let largest_used_root_page = roots.iter().copied().fold(1, i64::max);
+                if largest_used_root_page != largest_root_page as i64 {
+                    crate::with_btree_allocation_site!(
+                        IntegrityCheck,
+                        errors.try_push(IntegrityCheckError::LargestRootPageMismatch {
+                            largest_root_page: largest_used_root_page,
+                            header_largest_root_page: largest_root_page,
+                        })
+                    )?;
+                }
+            } else if incremental_vacuum != 0 {
+                crate::with_btree_allocation_site!(
+                    IntegrityCheck,
+                    errors.try_push(IntegrityCheckError::IncrementalVacuumWithoutLargestRootPage)
+                )?;
+            }
             let mut integrity_check_state = IntegrityCheckState::new(db_size as usize, auto_vacuum);
             let mut current_root_idx = 0;
 
@@ -17580,7 +17605,7 @@ pub fn op_integrity_check(
             *state.active_op_state.integrity_check() =
                 OpIntegrityCheckState::CheckingBTreeStructure {
                     errors,
-                    state: integrity_check_state,
+                    state: Box::new(integrity_check_state),
                     current_root_idx,
                     current_dropped_idx: 0,
                 };
@@ -17635,6 +17660,43 @@ pub fn op_integrity_check(
                 return Ok(InsnFunctionStepResult::Step);
             }
 
+            #[cfg(feature = "autovacuum")]
+            while integrity_check_state.checked_ptrmap_entries
+                < integrity_check_state.expected_ptrmap_entries.len()
+            {
+                let (page_no, expected) = integrity_check_state.expected_ptrmap_entries
+                    [integrity_check_state.checked_ptrmap_entries];
+                if page_no as usize <= integrity_check_state.db_size {
+                    let error = match target_pager.ptrmap_get(page_no) {
+                        Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
+                        Ok(IOResult::Done(Some(actual)))
+                            if actual.entry_type == expected.entry_type
+                                && actual.parent_page_no == expected.parent_page_no =>
+                        {
+                            None
+                        }
+                        Ok(IOResult::Done(Some(actual))) => {
+                            Some(IntegrityCheckError::PtrmapEntryMismatch {
+                                page_id: page_no as i64,
+                                expected_type: expected.entry_type as u8,
+                                expected_parent: expected.parent_page_no,
+                                actual_type: actual.entry_type as u8,
+                                actual_parent: actual.parent_page_no,
+                            })
+                        }
+                        Ok(IOResult::Done(None)) | Err(_) => {
+                            Some(IntegrityCheckError::PtrmapEntryUnreadable {
+                                page_id: page_no as i64,
+                            })
+                        }
+                    };
+                    if let Some(error) = error {
+                        crate::with_btree_allocation_site!(IntegrityCheck, errors.try_push(error))?;
+                    }
+                }
+                integrity_check_state.checked_ptrmap_entries += 1;
+            }
+
             if !has_freelist_error(errors)
                 && integrity_check_state.freelist_count.actual_count
                     != integrity_check_state.freelist_count.expected_count
@@ -17648,34 +17710,44 @@ pub fn op_integrity_check(
                 )?;
             }
 
-            let skip_page_never_used = integrity_check_state.auto_vacuum;
-
-            if !skip_page_never_used {
-                for page_number in 2..=integrity_check_state.db_size {
-                    if !integrity_check_state
-                        .page_reference
-                        .contains_key(&(page_number as i64))
-                    {
-                        if target_pager.pending_byte_page_id() != Some(page_number as u32) {
-                            crate::with_btree_allocation_site!(
-                                IntegrityCheck,
-                                errors.try_push(IntegrityCheckError::PageNeverUsed {
-                                    page_id: page_number as i64,
-                                })
-                            )?;
-                        }
-                    } else if target_pager.pending_byte_page_id() == Some(page_number as u32) {
+            for page_number in 2..=integrity_check_state.db_size {
+                #[cfg(feature = "autovacuum")]
+                let is_ptrmap_page = integrity_check_state.auto_vacuum
+                    && target_pager.is_ptrmap_page(page_number as u32);
+                #[cfg(not(feature = "autovacuum"))]
+                let is_ptrmap_page = false;
+                let is_referenced = integrity_check_state
+                    .page_reference
+                    .contains_key(&(page_number as i64));
+                if is_ptrmap_page {
+                    if is_referenced {
                         crate::with_btree_allocation_site!(
                             IntegrityCheck,
-                            errors.try_push(IntegrityCheckError::PendingBytePageUsed {
+                            errors.try_push(IntegrityCheckError::PtrmapPageReferenced {
                                 page_id: page_number as i64,
                             })
                         )?;
                     }
-
-                    if errors.len() >= *max_errors {
-                        break;
+                } else if !is_referenced {
+                    if target_pager.pending_byte_page_id() != Some(page_number as u32) {
+                        crate::with_btree_allocation_site!(
+                            IntegrityCheck,
+                            errors.try_push(IntegrityCheckError::PageNeverUsed {
+                                page_id: page_number as i64,
+                            })
+                        )?;
                     }
+                } else if target_pager.pending_byte_page_id() == Some(page_number as u32) {
+                    crate::with_btree_allocation_site!(
+                        IntegrityCheck,
+                        errors.try_push(IntegrityCheckError::PendingBytePageUsed {
+                            page_id: page_number as i64,
+                        })
+                    )?;
+                }
+
+                if errors.len() >= *max_errors {
+                    break;
                 }
             }
 
