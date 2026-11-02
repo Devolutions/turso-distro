@@ -271,6 +271,7 @@ pub fn translate_pragma(
             | PragmaName::TableXinfo
             | PragmaName::IntegrityCheck
             | PragmaName::DatabaseList
+            | PragmaName::IncrementalVacuum
             | PragmaName::QuickCheck => query_pragma(
                 pragma,
                 resolver,
@@ -624,6 +625,7 @@ fn update_pragma(
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
+        PragmaName::IncrementalVacuum => unreachable!("incremental_vacuum is not a setting"),
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
             let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
@@ -854,6 +856,21 @@ fn query_pragma(
     let schema = resolver.schema();
     let register = program.alloc_register();
     match pragma {
+        PragmaName::IncrementalVacuum => {
+            // Like SQLite, a missing, non-positive or out-of-range page count
+            // vacuums every free page.
+            let max_pages = match value.as_ref().map(parse_signed_number) {
+                Some(Ok(Value::Numeric(Numeric::Integer(n)))) if n > 0 && n <= i32::MAX as i64 => {
+                    n as u32
+                }
+                _ => i32::MAX as u32,
+            };
+            program.emit_insn(Insn::IncrVacuum {
+                db: database_id,
+                max_pages,
+            });
+            Ok(TransactionMode::Write)
+        }
         PragmaName::ApplicationId => {
             program.emit_insn(Insn::ReadCookie {
                 db: database_id,

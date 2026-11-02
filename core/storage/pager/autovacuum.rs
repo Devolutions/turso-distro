@@ -87,6 +87,14 @@ enum CommitState {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum IncrementalVacuumState {
+    Start,
+    SyncPtrmap,
+    SaveCursors,
+    Step { pages_left: u32 },
+}
+
+#[derive(Debug, Clone, Copy)]
 enum CreateRootState {
     Start,
     SyncPtrmap,
@@ -120,6 +128,7 @@ pub(super) struct AutoVacuumState {
     cursor_save: Option<(Vec<RegisteredCursor>, usize)>,
     incr_step: IncrVacuumStepState,
     commit: CommitState,
+    incremental: IncrementalVacuumState,
     create_root: CreateRootState,
     drop_root: DropRootState,
 }
@@ -131,6 +140,7 @@ impl AutoVacuumState {
             cursor_save: None,
             incr_step: IncrVacuumStepState::Start,
             commit: CommitState::Start,
+            incremental: IncrementalVacuumState::Start,
             create_root: CreateRootState::Start,
             drop_root: DropRootState::Start,
         }
@@ -787,6 +797,69 @@ impl Pager {
                     self.discard_pages_after(database_size)?;
                     self.vacuum_state.write().auto_vacuum.commit = CommitState::Start;
                     return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+
+    /// Runs up to `max_pages` steps of `PRAGMA incremental_vacuum` (SQLite's
+    /// `sqlite3BtreeIncrVacuum`, called once per page by `OP_IncrVacuum`).
+    pub fn incremental_vacuum(&self, max_pages: u32) -> IOResultOr<()> {
+        let result = self.incremental_vacuum_steps(max_pages);
+        if result.is_err() {
+            self.reset_auto_vacuum_state();
+        }
+        result
+    }
+
+    fn incremental_vacuum_steps(&self, max_pages: u32) -> IOResultOr<()> {
+        loop {
+            let state = self.vacuum_state.read().auto_vacuum.incremental;
+            match state {
+                IncrementalVacuumState::Start => {
+                    let mode = return_if_io!(self.with_header(auto_vacuum_mode_of));
+                    if mode == AutoVacuumMode::None || max_pages == 0 {
+                        return Ok(IOResult::Done(()));
+                    }
+                    self.vacuum_state.write().auto_vacuum.incremental =
+                        IncrementalVacuumState::SyncPtrmap;
+                }
+                IncrementalVacuumState::SyncPtrmap => {
+                    return_if_io!(self.ptrmap_sync_dirty_pages());
+                    self.vacuum_state.write().auto_vacuum.incremental =
+                        IncrementalVacuumState::SaveCursors;
+                }
+                IncrementalVacuumState::SaveCursors => {
+                    return_if_io!(self.save_all_cursor_positions());
+                    self.vacuum_state.write().auto_vacuum.incremental =
+                        IncrementalVacuumState::Step {
+                            pages_left: max_pages,
+                        };
+                }
+                IncrementalVacuumState::Step { pages_left } => {
+                    let (database_size, freelist_pages) = return_if_io!(self.with_header(
+                        |header| (header.database_size.get(), header.freelist_pages.get())
+                    ));
+                    let final_size = self
+                        .ptrmap_geometry()
+                        .final_db_size(database_size, freelist_pages);
+                    if database_size < final_size || freelist_pages >= database_size {
+                        bail_corrupt_error!(
+                            "freelist count {freelist_pages} does not fit a database of {database_size} pages"
+                        );
+                    }
+                    let progressed = pages_left > 0
+                        && freelist_pages > 0
+                        && return_if_io!(self.incr_vacuum_step(final_size, database_size, false));
+                    if !progressed {
+                        self.vacuum_state.write().auto_vacuum.incremental =
+                            IncrementalVacuumState::Start;
+                        return Ok(IOResult::Done(()));
+                    }
+                    self.vacuum_state.write().auto_vacuum.incremental =
+                        IncrementalVacuumState::Step {
+                            pages_left: pages_left - 1,
+                        };
                 }
             }
         }

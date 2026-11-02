@@ -172,6 +172,7 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             &["require_where"],
         ),
         FreelistCount => Pragma::new(PragmaFlags::Result0, &["freelist_count"]),
+        IncrementalVacuum => Pragma::new(PragmaFlags::NeedSchema | PragmaFlags::NoColumns, &[]),
         EncryptionKey => Pragma::new(
             PragmaFlags::Result0 | PragmaFlags::SchemaReq | PragmaFlags::NoColumns1,
             &["hexkey"],

@@ -2754,6 +2754,15 @@ pub fn insn_to_row(
             0,
             format!("schema={schema_name}, dest={dest_path}"),
         ),
+        Insn::IncrVacuum { db, max_pages } => (
+            "IncrVacuum",
+            *db as i64,
+            *max_pages as i64,
+            0,
+            Value::Null,
+            0,
+            format!("db={db}, max_pages={max_pages}"),
+        ),
         Insn::Vacuum { db } => (
             "Vacuum",
             *db as i64,

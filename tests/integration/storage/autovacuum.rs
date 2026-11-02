@@ -143,6 +143,8 @@ fn run_in_turso(path: &Path, statements: &[&str]) {
     conn.close().unwrap();
 }
 
+/// Steps every statement to completion: `PRAGMA incremental_vacuum` moves
+/// one page per row it returns.
 fn run_in_sqlite(path: &Path, statements: &[&str]) {
     let conn = rusqlite::Connection::open(path).unwrap();
     for statement in statements {
@@ -305,6 +307,17 @@ fn test_autovacuum_drop_table_keeps_sqlite_schema_in_rowid_order() {
         "CREATE TABLE t7(a INTEGER PRIMARY KEY, b TEXT)",
         "DROP TABLE t4",
         "INSERT INTO t7 VALUES (1, 'x')",
+    ]);
+}
+
+#[test]
+fn test_autovacuum_incremental_vacuum_matches_sqlite() {
+    assert_same_file_as_sqlite(&[
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)",
+        "INSERT INTO t(b) WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s WHERE value < 300) SELECT zeroblob(800) FROM s",
+        "DELETE FROM t WHERE a % 2 = 0",
+        "PRAGMA incremental_vacuum(10)",
+        "PRAGMA incremental_vacuum(0)",
     ]);
 }
 

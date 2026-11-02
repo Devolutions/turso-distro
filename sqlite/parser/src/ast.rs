@@ -1940,6 +1940,8 @@ pub enum PragmaName {
     LockingMode,
     /// Run a quick integrity check (skips expensive index consistency validation)
     QuickCheck,
+    /// Move free pages to the end of an auto-vacuum database file and truncate it.
+    IncrementalVacuum,
     /// encryption key for encrypted databases, specified as hexadecimal string.
     #[strum(serialize = "hexkey")]
     #[cfg_attr(feature = "serde", serde(rename = "hexkey"))]

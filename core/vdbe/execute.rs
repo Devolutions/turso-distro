@@ -19647,6 +19647,30 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
     }
 }
 
+/// `PRAGMA incremental_vacuum`: moves up to `max_pages` pages from the end
+/// of an auto-vacuum database into free pages and truncates the file.
+pub fn op_incr_vacuum(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(IncrVacuum { db, max_pages }, insn);
+    if program.connection.mv_store_for_db(*db).is_none() {
+        let vacuum_pager = if *db != MAIN_DB_ID {
+            program.get_pager_from_database_index(db)?
+        } else {
+            pager.clone()
+        };
+        #[cfg(feature = "autovacuum")]
+        return_if_io!(state, vacuum_pager.incremental_vacuum(*max_pages));
+        #[cfg(not(feature = "autovacuum"))]
+        let _ = (vacuum_pager, max_pages);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// In-place VACUUM - compact the database via target build + direct-WAL
 /// copy-back. The opcode owns the source transaction lifecycle.
 pub fn op_vacuum(
