@@ -6,7 +6,7 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::{
     emitter::Resolver,
-    schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+    schema::{emit_destroy_root_page, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
@@ -477,6 +477,7 @@ pub fn translate_drop_view(
         return Ok(());
     }
 
+    let schema_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     // If this is a materialized view, we need to destroy its btree as well
     // and also clean up the associated DBSP state table and index
     let dbsp_table_name = if is_materialized_view {
@@ -485,12 +486,7 @@ pub fn translate_drop_view(
         {
             if let Some(btree_table) = table.btree() {
                 // Destroy the btree for the materialized view
-                program.emit_insn(Insn::Destroy {
-                    db: database_id,
-                    root: btree_table.root_page,
-                    former_root_reg: 0, // No autovacuum
-                    is_temp: 0,
-                });
+                emit_destroy_root_page(program, database_id, btree_table.root_page, &schema_table);
             }
         }
 
@@ -510,12 +506,7 @@ pub fn translate_drop_view(
             s.get_indices(dbsp_table_name).cloned().collect()
         });
         for index in &dbsp_indexes {
-            program.emit_insn(Insn::Destroy {
-                db: database_id,
-                root: index.root_page,
-                former_root_reg: 0, // No autovacuum
-                is_temp: 0,
-            });
+            emit_destroy_root_page(program, database_id, index.root_page, &schema_table);
         }
 
         // Destroy DBSP state table btree
@@ -523,12 +514,12 @@ pub fn translate_drop_view(
             resolver.with_schema(database_id, |s| s.get_table(dbsp_table_name))
         {
             if let Some(dbsp_btree_table) = dbsp_table.btree() {
-                program.emit_insn(Insn::Destroy {
-                    db: database_id,
-                    root: dbsp_btree_table.root_page,
-                    former_root_reg: 0, // No autovacuum
-                    is_temp: 0,
-                });
+                emit_destroy_root_page(
+                    program,
+                    database_id,
+                    dbsp_btree_table.root_page,
+                    &schema_table,
+                );
             }
         }
     }

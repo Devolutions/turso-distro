@@ -97,12 +97,31 @@ enum CreateRootState {
     InitRoot { root: u32 },
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DropRootState {
+    Start,
+    FreeRoot {
+        largest_root: u32,
+    },
+    MoveLargestRoot {
+        largest_root: u32,
+    },
+    FreeLargestRoot {
+        largest_root: u32,
+    },
+    UpdateLargestRoot {
+        largest_root: u32,
+        moved: Option<u32>,
+    },
+}
+
 pub(super) struct AutoVacuumState {
     sync: Option<(Vec<u32>, usize)>,
     cursor_save: Option<(Vec<RegisteredCursor>, usize)>,
     incr_step: IncrVacuumStepState,
     commit: CommitState,
     create_root: CreateRootState,
+    drop_root: DropRootState,
 }
 
 impl AutoVacuumState {
@@ -113,6 +132,7 @@ impl AutoVacuumState {
             incr_step: IncrVacuumStepState::Start,
             commit: CommitState::Start,
             create_root: CreateRootState::Start,
+            drop_root: DropRootState::Start,
         }
     }
 }
@@ -883,6 +903,97 @@ impl Pager {
                     header.borrow_mut().vacuum_mode_largest_root_page = root.into();
                     self.vacuum_state.write().auto_vacuum.create_root = CreateRootState::Start;
                     return Ok(IOResult::Done(root));
+                }
+            }
+        }
+    }
+
+    /// Frees the root page `root` of a b-tree whose other pages were already
+    /// freed. In an auto-vacuum database the root page with the largest
+    /// number moves into the freed slot so that root pages stay at the start
+    /// of the file; its old number is returned (SQLite's `btreeDropTable`).
+    pub(crate) fn free_root_page(&self, root: u32) -> IOResultOr<Option<u32>> {
+        let result = self.free_root_page_steps(root);
+        if result.is_err() {
+            self.reset_auto_vacuum_state();
+        }
+        result
+    }
+
+    fn free_root_page_steps(&self, root: u32) -> IOResultOr<Option<u32>> {
+        let geometry = self.ptrmap_geometry();
+        loop {
+            let state = self.vacuum_state.read().auto_vacuum.drop_root;
+            match state {
+                DropRootState::Start => {
+                    let (mode, largest_root) = return_if_io!(self.with_header(|header| (
+                        auto_vacuum_mode_of(header),
+                        header.vacuum_mode_largest_root_page.get()
+                    )));
+                    if mode == AutoVacuumMode::None {
+                        return_if_io!(self.free_page(None, root as usize));
+                        return Ok(IOResult::Done(None));
+                    }
+                    self.vacuum_state.write().auto_vacuum.drop_root = if root == largest_root {
+                        DropRootState::FreeRoot { largest_root }
+                    } else {
+                        DropRootState::MoveLargestRoot { largest_root }
+                    };
+                }
+                DropRootState::FreeRoot { largest_root } => {
+                    return_if_io!(self.free_page(None, root as usize));
+                    self.vacuum_state.write().auto_vacuum.drop_root =
+                        DropRootState::UpdateLargestRoot {
+                            largest_root,
+                            moved: None,
+                        };
+                }
+                DropRootState::MoveLargestRoot { largest_root } => {
+                    let entry = return_if_io!(self.ptrmap_get(largest_root));
+                    if !matches!(
+                        entry,
+                        Some(PtrmapEntry {
+                            entry_type: PtrmapType::RootPage,
+                            ..
+                        })
+                    ) {
+                        bail_corrupt_error!(
+                            "largest root page {largest_root} is not a root page ({entry:?})"
+                        );
+                    }
+                    return_if_io!(self.relocate_page(
+                        largest_root,
+                        PtrmapEntry {
+                            entry_type: PtrmapType::RootPage,
+                            parent_page_no: 0,
+                        },
+                        root,
+                    ));
+                    self.invalidate_all_cursors();
+                    self.vacuum_state.write().auto_vacuum.drop_root =
+                        DropRootState::FreeLargestRoot { largest_root };
+                }
+                DropRootState::FreeLargestRoot { largest_root } => {
+                    return_if_io!(self.free_page(None, largest_root as usize));
+                    self.vacuum_state.write().auto_vacuum.drop_root =
+                        DropRootState::UpdateLargestRoot {
+                            largest_root,
+                            moved: Some(largest_root),
+                        };
+                }
+                DropRootState::UpdateLargestRoot {
+                    largest_root,
+                    moved,
+                } => {
+                    let mut new_largest_root = largest_root - 1;
+                    while geometry.is_unmapped_page(new_largest_root) {
+                        new_largest_root -= 1;
+                    }
+                    return_if_io!(self.with_header_mut(|header| {
+                        header.vacuum_mode_largest_root_page = new_largest_root.into()
+                    }));
+                    self.vacuum_state.write().auto_vacuum.drop_root = DropRootState::Start;
+                    return Ok(IOResult::Done(moved));
                 }
             }
         }
