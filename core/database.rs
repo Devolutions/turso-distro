@@ -2030,8 +2030,14 @@ impl Database {
                         tracing::warn!(
                             "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Opening in readonly mode."
                         );
-                        self.open_flags |= OpenFlags::ReadOnly;
+                        // The file exists: without Create, a read-only open
+                        // does not create a WAL file either.
+                        self.open_flags.insert(OpenFlags::ReadOnly);
+                        self.open_flags.remove(OpenFlags::Create);
                     }
+                    // The fallback above makes the database read-only too, so
+                    // the header must not be converted to WAL below.
+                    let is_readonly = is_readonly || self.is_readonly();
 
                     let header: HeaderRefMut = return_if_io!(HeaderRefMut::from_pager(pager));
                     let header_mut = header.borrow_mut();
