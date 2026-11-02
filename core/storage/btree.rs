@@ -19,7 +19,7 @@ use crate::{
     io_yield_one,
     schema::{BTreeTable, Index},
     storage::{
-        pager::{BtreePageAllocMode, Pager},
+        pager::{BtreePageAllocMode, NewPageKind, Pager},
         sqlite3_ondisk::{
             payload_overflows, read_u32, read_varint, write_varint, BTreeCell, DatabaseHeader,
             PageContent, PageSize, PageType, TableInteriorCell, CELL_PTR_SIZE_BYTES,
@@ -10437,7 +10437,15 @@ fn fill_cell_payload(
                         *src_data_offset += amount_to_copy;
                     }
                     CopyDataState::AllocateOverflowPage => {
-                        let new_overflow_page = match pager.allocate_overflow_page() {
+                        let kind = match current_overflow_page {
+                            Some(prev_page) => NewPageKind::NextOverflow {
+                                previous: prev_page.get().id() as u32,
+                            },
+                            None => NewPageKind::FirstOverflow {
+                                cell_page: page.get().id() as u32,
+                            },
+                        };
+                        let new_overflow_page = match pager.allocate_overflow_page(kind) {
                             Ok(IOResult::Done(new_overflow_page)) => {
                                 PinGuard::new(new_overflow_page)
                             }
