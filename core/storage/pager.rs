@@ -5251,6 +5251,47 @@ impl Pager {
         Ok(())
     }
 
+    /// Writes the rollback-journal version numbers (1, 1) back into the
+    /// database header once a TRUNCATE checkpoint has emptied the WAL, the
+    /// way SQLite leaves WAL mode for `PRAGMA journal_mode=DELETE`. Returns
+    /// `false` and leaves the file in WAL mode when the WAL still holds
+    /// frames or the pages go through a codec.
+    ///
+    /// The WAL file itself stays until the database is dropped: a later
+    /// connection may still use it, and SQLite reads a WAL file that exists
+    /// whatever the header says, so a crash in between loses nothing.
+    pub fn restore_rollback_journal_header(&self) -> Result<bool> {
+        let Some(wal) = self.wal.as_ref() else {
+            return Ok(false);
+        };
+        if wal.get_max_frame_in_wal() != 0
+            || wal.wal_file()?.size()? != 0
+            || self.io_ctx.read().has_codec_transform()
+        {
+            return Ok(false);
+        }
+        let page = self.io.block(|| self.read_header_page())?;
+        {
+            let contents = page.get_contents();
+            let header = bytemuck::from_bytes_mut::<DatabaseHeader>(
+                &mut contents.as_ptr()[0..DatabaseHeader::SIZE],
+            );
+            let legacy = sqlite3_ondisk::RawVersion::from(sqlite3_ondisk::Version::Legacy);
+            header.write_version = legacy;
+            header.read_version = legacy;
+        }
+        let c = begin_write_btree_page(self, &page, None)?;
+        self.io.wait_for_completion(c)?;
+        let c = sqlite3_ondisk::begin_sync(
+            self.db_file.as_ref(),
+            self.syncing.clone(),
+            self.get_sync_type(),
+        )?;
+        self.io.wait_for_completion(c)?;
+        self.clear_page_cache(false);
+        Ok(true)
+    }
+
     /// Perform a blocking checkpoint with the specified mode.
     /// This is a convenience wrapper around `checkpoint()` that blocks until completion.
     /// Explicit checkpoints clear the page cache after completion.

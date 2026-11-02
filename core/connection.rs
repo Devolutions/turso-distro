@@ -584,6 +584,22 @@ crate::assert::assert_send_sync!(Connection);
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // Bindings such as the Rust crate drop connections without closing
+        // them. A database that goes back to rollback-journal mode needs the
+        // checkpoint that close() runs for the last connection, so dropping
+        // one closes it.
+        if !self.is_closed()
+            && self.db.opts.restore_rollback_journal
+            && self
+                .db
+                .opened_in_rollback_journal_mode
+                .load(Ordering::SeqCst)
+        {
+            if let Err(err) = self.close() {
+                tracing::warn!("closing a dropped connection failed: {err}");
+            }
+            return;
+        }
         if !self.is_closed() {
             // A handle dropped mid-transaction rolls that transaction back
             // below, so parked index-method cursors must receive the same
@@ -2455,9 +2471,21 @@ impl Connection {
             && !is_memory_db
             && should_checkpoint_on_close
         {
-            self.pager
-                .load()
-                .checkpoint_shutdown(self.wal_auto_actions(), self.get_sync_mode())?;
+            let pager = self.pager.load();
+            pager.checkpoint_shutdown(self.wal_auto_actions(), self.get_sync_mode())?;
+            if self.db.opts.restore_rollback_journal
+                && !self.db.opts.enable_multiprocess_wal
+                && self
+                    .db
+                    .opened_in_rollback_journal_mode
+                    .load(Ordering::SeqCst)
+                && self.db.get_mv_store().is_none()
+                && pager.restore_rollback_journal_header()?
+            {
+                self.db
+                    .rollback_journal_restored
+                    .store(true, Ordering::SeqCst);
+            }
         };
         Ok(())
     }

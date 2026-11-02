@@ -402,6 +402,7 @@ impl TursoDatabaseConfig {
                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
                 "without_rowid" => opts.with_without_rowid(true),
                 "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
+                "restore_rollback_journal" => opts.with_restore_rollback_journal(true),
                 // "strict" is always enabled, kept for backwards compatibility
                 _ => opts,
             };

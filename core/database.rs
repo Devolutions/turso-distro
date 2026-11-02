@@ -81,6 +81,9 @@ pub struct DatabaseOpts {
     pub enable_multiprocess_wal: bool,
     pub enable_without_rowid: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
+    /// Switch a database that was in rollback-journal mode when it was
+    /// opened back to that mode when its last connection closes.
+    pub restore_rollback_journal: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
 }
@@ -123,6 +126,17 @@ impl DatabaseOpts {
 
     pub fn with_vacuum(mut self, enable: bool) -> Self {
         self.enable_vacuum = enable;
+        self
+    }
+
+    /// Turso runs every database it writes in WAL mode, and a database that
+    /// SQLite left in rollback-journal mode is switched to WAL when it is
+    /// opened for writing. With this option, once the last connection has
+    /// closed and the WAL is checkpointed, the database goes back to
+    /// rollback-journal mode, as SQLite's `PRAGMA journal_mode=DELETE` does:
+    /// the header says so again and the WAL file is deleted.
+    pub fn with_restore_rollback_journal(mut self, enable: bool) -> Self {
+        self.restore_rollback_journal = enable;
         self
     }
 
@@ -681,6 +695,12 @@ pub struct Database<
     dialect: Arc<dyn Dialect>,
     pub(crate) opts: DatabaseOpts,
     pub(crate) n_connections: AtomicUsize,
+    /// The database file was in rollback-journal mode when it was opened and
+    /// was switched to WAL (see [`DatabaseOpts::with_restore_rollback_journal`]).
+    pub(crate) opened_in_rollback_journal_mode: AtomicBool,
+    /// The header was switched back to rollback-journal mode when the last
+    /// connection closed; the WAL file is deleted when the database is dropped.
+    pub(crate) rollback_journal_restored: AtomicBool,
     /// Process-unique id minted at construction. Unlike the `Arc`'s heap
     /// address, this can never repeat within a process, so detach/reattach
     /// and close/reopen produce distinguishable values.
@@ -747,6 +767,52 @@ impl fmt::Debug for Database {
                 .load(crate::sync::atomic::Ordering::SeqCst),
         );
         debug_struct.finish()
+    }
+}
+
+impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Database<A, F> {
+    fn drop(&mut self) {
+        if self.rollback_journal_restored.load(Ordering::SeqCst) {
+            self.remove_restored_wal_file();
+        }
+    }
+}
+
+impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Database<A, F> {
+    /// Deletes the WAL file of a database that went back to rollback-journal
+    /// mode (see [`DatabaseOpts::with_restore_rollback_journal`]), so that
+    /// SQLite opens it in rollback-journal mode again. The file is kept if it
+    /// holds frames, or if another `Database` for the same file is live or
+    /// being opened in this process and may be using it. The registry holds
+    /// one entry per file; its lock is held so that no such open can start
+    /// in between, and the entry is checked without upgrading it, since
+    /// dropping an upgraded `Database` here would take the lock again.
+    fn remove_restored_wal_file(&self) {
+        let wal_is_empty = self
+            .shared_wal
+            .read()
+            .runtime
+            .file
+            .as_ref()
+            .is_some_and(|file| file.size().is_ok_and(|size| size == 0));
+        if !wal_is_empty {
+            return;
+        }
+        let Ok(file_id) = self.io.file_id(&self.path) else {
+            return;
+        };
+        let registry = DATABASE_MANAGER.lock();
+        let wal_in_use = match registry.get(&DatabaseKey::File(file_id)) {
+            Some(RegistryEntry::Opening) => true,
+            Some(RegistryEntry::Ready(weak)) => weak.strong_count() > 0,
+            None => false,
+        };
+        if wal_in_use {
+            return;
+        }
+        if let Err(err) = self.io.remove_file(&self.wal_path) {
+            tracing::warn!("could not delete the WAL file {}: {err}", self.wal_path);
+        }
     }
 }
 
@@ -823,6 +889,8 @@ impl Database {
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
+            opened_in_rollback_journal_mode: AtomicBool::new(false),
+            rollback_journal_restored: AtomicBool::new(false),
             incarnation: {
                 // Deliberately std, not crate::sync: this static outlives a
                 // shuttle test execution, and a shuttle-tracked atomic that
@@ -2105,6 +2173,8 @@ impl Database {
                                 // Convert Legacy to WAL mode
                                 header_mut.read_version = RawVersion::from(Version::Wal);
                                 header_mut.write_version = RawVersion::from(Version::Wal);
+                                self.opened_in_rollback_journal_mode
+                                    .store(true, Ordering::SeqCst);
                                 true
                             }
                         }
