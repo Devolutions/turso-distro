@@ -218,7 +218,7 @@ avoid this window.
 |----------------------------------|------------|----------------------------------------------|
 | PRAGMA analysis_limit            | ❌ No         |                                              |
 | PRAGMA application_id            | ✅ Yes        |                                              |
-| PRAGMA auto_vacuum               | 🚧 Partial    | Read works; write requires `--experimental-autovacuum` |
+| PRAGMA auto_vacuum               | ✅ Yes        | Writing to auto-vacuum databases requires `--experimental-autovacuum` |
 | PRAGMA automatic_index           | ❌ No         |                                              |
 | PRAGMA busy_timeout              | ✅ Yes         |                                              |
 | PRAGMA cache_size                | ✅ Yes        |                                              |
@@ -245,7 +245,7 @@ avoid this window.
 | PRAGMA function_list             | ✅ Yes        |                                              |
 | PRAGMA hard_heap_limit           | ❌ No         |                                              |
 | PRAGMA ignore_check_constraints  | ✅ Yes        |                                              |
-| PRAGMA incremental_vacuum        | ❌ No         |                                              |
+| PRAGMA incremental_vacuum        | ✅ Yes        | Requires `--experimental-autovacuum`; returns no rows (SQLite returns one empty row per page) |
 | PRAGMA index_info                | ✅ Yes        |                                              |
 | PRAGMA index_list                | ✅ Yes        |                                              |
 | PRAGMA index_xinfo               | ✅ Yes        |                                              |
