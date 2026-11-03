@@ -738,3 +738,67 @@ fn test_rollback_journal_option_on_in_memory_database() {
     assert_eq!(turso_texts(&conn, "SELECT a FROM t"), rows(&["in memory"]));
     assert_eq!(turso_texts(&conn, "PRAGMA journal_mode"), rows(&["wal"]));
 }
+
+/// AUTOINCREMENT keeps its counters in sqlite_sequence, as in SQLite, and
+/// both engines continue each other's counters.
+#[test]
+fn test_rollback_journal_autoincrement_uses_sqlite_sequence() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("autoinc.db");
+    {
+        let db = open_in_sdk(&path, OpenFlags::Create, "rollback_journal").unwrap();
+        sdk_execute(
+            &db,
+            "CREATE TABLE h(ID INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT); \
+             INSERT INTO h(v) VALUES ('a'); INSERT INTO h(v) VALUES ('b'); \
+             INSERT INTO h(v) VALUES ('c'); DELETE FROM h WHERE ID = 3",
+        );
+    }
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        sqlite_texts(
+            &sqlite,
+            "SELECT name FROM sqlite_master WHERE name LIKE '%turso%' OR name = 'sqlite_sequence'"
+        ),
+        rows(&["sqlite_sequence"])
+    );
+    assert_eq!(
+        sqlite_texts(
+            &sqlite,
+            "SELECT sql FROM sqlite_master WHERE name = 'sqlite_sequence'"
+        ),
+        rows(&["CREATE TABLE sqlite_sequence(name,seq)"])
+    );
+    assert_eq!(
+        sqlite_texts(&sqlite, "SELECT name || '=' || seq FROM sqlite_sequence"),
+        rows(&["h=3"])
+    );
+    sqlite
+        .execute("INSERT INTO h(v) VALUES ('from sqlite')", [])
+        .unwrap();
+    assert_eq!(
+        sqlite_texts(&sqlite, "SELECT CAST(ID AS TEXT) FROM h ORDER BY ID"),
+        rows(&["1", "2", "4"])
+    );
+    drop(sqlite);
+    {
+        let db = open_in_sdk(&path, OpenFlags::None, "rollback_journal").unwrap();
+        sdk_execute(
+            &db,
+            "DELETE FROM h WHERE ID = 4; INSERT INTO h(v) VALUES ('turso again')",
+        );
+    }
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        sqlite_texts(&sqlite, "SELECT CAST(ID AS TEXT) FROM h ORDER BY ID"),
+        rows(&["1", "2", "5"])
+    );
+    assert_eq!(
+        sqlite_texts(&sqlite, "SELECT name || '=' || seq FROM sqlite_sequence"),
+        rows(&["h=5"])
+    );
+    assert_eq!(
+        sqlite_texts(&sqlite, "PRAGMA integrity_check"),
+        rows(&["ok"])
+    );
+}
