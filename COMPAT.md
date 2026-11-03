@@ -1043,6 +1043,14 @@ Modifiers:
 We currently don't have plan to support the rollback journal mode as it locks the database file during writes.
 Therefore, all rollback-type modes (delete, truncate, persist, memory) are marked are `Not Needed` below.
 
+A database that SQLite left in rollback-journal mode is switched to WAL when Turso opens it for writing.
+With `DatabaseOpts::with_rollback_journal` (`Builder::rollback_journal` in the Rust crate,
+`--rollback-journal` in the CLI) it stays in rollback-journal mode instead, and Turso takes SQLite's
+file locks on it, so SQLite processes can read and write it at the same time. Turso still writes each
+transaction through its WAL, under the EXCLUSIVE lock, and empties the WAL before releasing the lock;
+it rolls back the hot journal a SQLite writer left behind. `PRAGMA journal_mode` cannot change the
+mode of such a database.
+
 | Journal mode | Status     | Comment                        |
 |--------------|------------|--------------------------------|
 | wal          | ✅ Yes        |                                |

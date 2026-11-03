@@ -36,6 +36,7 @@ use crate::{
         page_cache::PageCache,
         page_transform::PageTransform,
         pager::{self, HeaderRef, HeaderRefMut, SharedPagerState},
+        rollback_journal::RollbackJournal,
         sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion, TextEncoding, Version},
     },
     sync::{
@@ -85,6 +86,9 @@ pub struct DatabaseOpts {
     /// write the conversion and keep the current mode.
     pub enable_mvcc: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
+    /// Keep a database that is in rollback-journal mode in that mode, with
+    /// SQLite's file locks.
+    pub rollback_journal: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
 }
@@ -132,6 +136,17 @@ impl DatabaseOpts {
 
     pub fn with_mvcc(mut self, enable: bool) -> Self {
         self.enable_mvcc = enable;
+        self
+    }
+
+    /// Turso runs every database it writes in WAL mode, and a database that
+    /// SQLite left in rollback-journal mode is switched to WAL when it is
+    /// opened for writing. With this option such a database stays in
+    /// rollback-journal mode, and Turso takes SQLite's file locks on it, so
+    /// that SQLite processes can read and write it at the same time, on a
+    /// local disk or a network share (see `storage::rollback_journal`).
+    pub fn with_rollback_journal(mut self, enable: bool) -> Self {
+        self.rollback_journal = enable;
         self
     }
 
@@ -773,6 +788,9 @@ impl fmt::Debug for Database {
 
 impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Database<A, F> {
     fn drop(&mut self) {
+        if self.pager_state.rollback_journal.load().is_some() {
+            self.remove_empty_wal_file();
+        }
         let Some(key) = self.registry_key.get() else {
             return;
         };
@@ -781,6 +799,46 @@ impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Data
         if matches!(registry.get(key), Some(RegistryEntry::Ready(weak)) if weak.strong_count() == 0)
         {
             registry.remove(key);
+        }
+    }
+}
+
+impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Database<A, F> {
+    /// Deletes the empty WAL file of a database in rollback-journal mode
+    /// (see [`DatabaseOpts::with_rollback_journal`]), which leaves nothing
+    /// next to the database file, as SQLite does. The file is kept if it
+    /// holds frames, or if another `Database` for the same file is live or
+    /// being opened in this process and may be using it. The registry holds
+    /// one entry per file; its lock is held so that no such open can start
+    /// in between, and the entry is checked without upgrading it, since
+    /// dropping an upgraded `Database` here would take the lock again. No
+    /// other process writes this WAL: the open-time lock keeps out other
+    /// writers (see [`Self::start_rollback_journal_mode`]).
+    fn remove_empty_wal_file(&self) {
+        let wal_is_empty = self
+            .shared_wal
+            .read()
+            .runtime
+            .file
+            .as_ref()
+            .is_some_and(|file| file.size().is_ok_and(|size| size == 0));
+        if !wal_is_empty {
+            return;
+        }
+        let Ok(file_id) = self.io.file_id(&self.path) else {
+            return;
+        };
+        let registry = DATABASE_MANAGER.lock();
+        let wal_in_use = match registry.get(&DatabaseKey::File(file_id)) {
+            Some(RegistryEntry::Opening) => true,
+            Some(RegistryEntry::Ready(weak)) => weak.strong_count() > 0,
+            None => false,
+        };
+        if wal_in_use {
+            return;
+        }
+        if let Err(err) = self.io.remove_file(&self.wal_path) {
+            tracing::warn!("could not delete the WAL file {}: {err}", self.wal_path);
         }
     }
 }
@@ -944,6 +1002,14 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
     ) -> Result<OpenFlags> {
+        // SQLite's locks must not meet Turso's whole-file lock on Unix, see
+        // `Database::start_rollback_journal_mode`.
+        #[cfg(unix)]
+        let flags = if opts.rollback_journal && !flags.contains(OpenFlags::ReadOnly) {
+            flags | OpenFlags::NoLock
+        } else {
+            flags
+        };
         if !opts.enable_multiprocess_wal {
             return Ok(flags);
         }
@@ -1725,6 +1791,20 @@ impl Database {
                             // Release the schema lock
                             state.schema_guard = None;
                         }
+                        // A SQLite writer holds EXCLUSIVE. Open anyway, as
+                        // SQLite does, and read the schema at the first
+                        // statement: no schema cookie of a database with
+                        // tables is 0, so the first prepare reparses it.
+                        Err(err)
+                            if matches!(err.as_ref(), LimboError::Busy)
+                                && pager.shared_rollback_journal_mode() =>
+                        {
+                            schema.schema_version = 0;
+                            state.schema_guard = None;
+                            state.make_from_btree_state = schema::MakeFromBtreeState::new();
+                            state.phase = OpenDbAsyncPhase::BootstrapMvStore;
+                            continue;
+                        }
                         Err(e) => return Err(e),
                     }
 
@@ -1902,6 +1982,15 @@ impl Database {
                         pager.set_page_codec(codec.clone())?;
                     }
 
+                    // In rollback-journal mode the WAL is empty between
+                    // transactions, and the first read transaction drops the
+                    // page cache anyway: only a page codec needs page 1 here.
+                    // A SQLite writer holding EXCLUSIVE must not fail the
+                    // connect.
+                    if pager.shared_rollback_journal_mode() && page_codec.is_none() {
+                        return Ok(IOResult::Done(pager));
+                    }
+
                     // Start a read transaction before reading page 1 to prevent a concurrent
                     // checkpoint from truncating the WAL underneath bootstrap. Under heavy
                     // same-process connection churn, the shared WAL bootstrap path can
@@ -1993,6 +2082,44 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// Whether the database stays in rollback-journal mode, with SQLite's
+    /// file locks (see [`DatabaseOpts::with_rollback_journal`]).
+    pub(crate) fn in_rollback_journal_mode(&self) -> bool {
+        self.pager_state.rollback_journal.load().is_some()
+    }
+
+    /// Keeps a rollback-journal database in that mode, with SQLite's file
+    /// locks (see [`DatabaseOpts::with_rollback_journal`]).
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    fn start_rollback_journal_mode(&self, is_readonly: bool) -> Result<()> {
+        let Some(file) = self.db_file.file() else {
+            return Err(LimboError::InvalidArgument(
+                "rollback-journal mode needs a database file".to_string(),
+            ));
+        };
+        // One writing process per file, as without the option. On Unix the
+        // usual whole-file lock would block SQLite, so the file was opened
+        // without it, and a byte far past SQLite's locks takes its place.
+        // (Windows already locks such a byte.)
+        #[cfg(unix)]
+        if !is_readonly && !file.try_lock_range(1 << 62, 1, true)? {
+            return Err(LimboError::LockingError(
+                "Failed locking file. File is locked by another process".to_string(),
+            ));
+        }
+        let journal = RollbackJournal::new(
+            self.io.clone(),
+            file,
+            &self.path,
+            &self.wal_path,
+            self.open_flags,
+        );
+        self.pager_state
+            .rollback_journal
+            .store(Some(Arc::new(journal)));
+        Ok(())
     }
 
     /// Checks the Version numbers in the DatabaseHeader, and changes it according to the required options
@@ -2179,6 +2306,14 @@ impl Database {
                     // Now check the Header Version to see which mode the DB file really is on
                     // Track if header was modified so we can write it to disk
                     let header_modified = match read_version {
+                        Version::Legacy
+                            if self.opts.rollback_journal
+                                && !open_mv_store
+                                && !self.opts.enable_multiprocess_wal =>
+                        {
+                            self.start_rollback_journal_mode(is_readonly)?;
+                            false
+                        }
                         Version::Legacy => {
                             if is_readonly {
                                 tracing::warn!(
@@ -2196,6 +2331,19 @@ impl Database {
                         Version::Wal => false,
                         Version::Mvcc => false,
                     };
+
+                    // The rollback-journal option opens the file without the
+                    // open-time lock on Unix; a database in WAL mode takes it
+                    // back.
+                    #[cfg(unix)]
+                    if self.opts.rollback_journal
+                        && self.pager_state.rollback_journal.load().is_none()
+                        && !is_readonly
+                    {
+                        if let Some(file) = self.db_file.file() {
+                            file.lock_file(true)?;
+                        }
+                    }
 
                     // In WAL mode, a logical log is always unexpected.
                     // In MVCC mode, WAL and logical-log coexistence can happen across interrupted checkpoint
@@ -2368,6 +2516,9 @@ impl Database {
                     };
 
                     self.shared_wal = shared_wal;
+                    if let Some(journal) = self.pager_state.rollback_journal.load_full() {
+                        journal.set_shared_wal(self.shared_wal.clone());
+                    }
                     let last_checksum_and_max_frame =
                         self.shared_wal.read().last_checksum_and_max_frame();
                     let wal =

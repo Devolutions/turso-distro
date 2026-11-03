@@ -2449,6 +2449,7 @@ fn vacuum_in_place_step(
                             wal.release_vacuum_lock();
                             cleanup_state.vacuum_lock_held = false;
                         }
+                        source_pager.finish_rollback_journal_vacuum()?;
                         *phase = VacuumInPlacePhase::InstallCommittedImage;
                         continue;
                     }
@@ -2546,6 +2547,9 @@ fn vacuum_in_place_cleanup(
         }
         drop(cleanup_state.mvcc_guard.take());
         drop(temp_db);
+        if let Ok(pager) = connection.get_pager_from_database_index(&db) {
+            pager.end_rollback_journal_tx();
+        }
         return Ok(());
     }
 

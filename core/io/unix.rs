@@ -179,6 +179,72 @@ pub(crate) fn unix_shared_wal_lock_byte(
     }
 }
 
+/// Lock kind for rollback-journal byte-range locks. Linux OFD locks conflict
+/// with SQLite's POSIX locks even inside one process, and closing another
+/// descriptor of the file does not drop them.
+fn unix_range_lock_cmd() -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    {
+        libc::F_OFD_SETLK
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        libc::F_SETLK
+    }
+}
+
+pub(crate) fn unix_try_lock_range(
+    fd: RawFd,
+    offset: u64,
+    len: u64,
+    exclusive: bool,
+) -> Result<bool> {
+    let mut flock = libc::flock {
+        l_type: if exclusive {
+            libc::F_WRLCK as libc::c_short
+        } else {
+            libc::F_RDLCK as libc::c_short
+        },
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: offset as libc::off_t,
+        l_len: len as libc::off_t,
+        l_pid: 0,
+        #[cfg(target_os = "freebsd")]
+        l_sysid: 0,
+    };
+    let rc = unsafe { libc::fcntl(fd, unix_range_lock_cmd(), &mut flock) };
+    if rc == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == ErrorKind::WouldBlock || error.raw_os_error() == Some(libc::EACCES) {
+            return Ok(false);
+        }
+        return Err(LimboError::LockingError(format!(
+            "Failed locking file range: {error}"
+        )));
+    }
+    Ok(true)
+}
+
+pub(crate) fn unix_unlock_range(fd: RawFd, offset: u64, len: u64) -> Result<()> {
+    let mut flock = libc::flock {
+        l_type: libc::F_UNLCK as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: offset as libc::off_t,
+        l_len: len as libc::off_t,
+        l_pid: 0,
+        #[cfg(target_os = "freebsd")]
+        l_sysid: 0,
+    };
+    let rc = unsafe { libc::fcntl(fd, unix_range_lock_cmd(), &mut flock) };
+    if rc == -1 {
+        return Err(LimboError::LockingError(format!(
+            "Failed unlocking file range: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn unix_shared_wal_unlock_byte(
     fd: RawFd,
     offset: u64,
@@ -508,6 +574,14 @@ impl File for UnixFile {
             }
             Err(e) => Err(io_error(e, "truncate")),
         }
+    }
+
+    fn try_lock_range(&self, offset: u64, len: u64, exclusive: bool) -> Result<bool> {
+        unix_try_lock_range(self.file.as_raw_fd(), offset, len, exclusive)
+    }
+
+    fn unlock_range(&self, offset: u64, len: u64) -> Result<()> {
+        unix_unlock_range(self.file.as_raw_fd(), offset, len)
     }
 
     fn shared_wal_lock_byte(

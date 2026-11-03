@@ -8,6 +8,7 @@ use crate::error::io_error;
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::unix::{
     unix_shared_wal_lock_byte, unix_shared_wal_map, unix_shared_wal_unlock_byte,
+    unix_try_lock_range, unix_unlock_range,
 };
 use crate::storage::wal::CKPT_BATCH_PAGES;
 use crate::sync::Mutex;
@@ -866,6 +867,14 @@ impl File for UringFile {
                 Err(e) => Err(io_error(e, "truncate")),
             }
         }
+    }
+
+    fn try_lock_range(&self, offset: u64, len: u64, exclusive: bool) -> Result<bool> {
+        unix_try_lock_range(self.file.as_raw_fd(), offset, len, exclusive)
+    }
+
+    fn unlock_range(&self, offset: u64, len: u64) -> Result<()> {
+        unix_unlock_range(self.file.as_raw_fd(), offset, len)
     }
 
     fn shared_wal_lock_byte(

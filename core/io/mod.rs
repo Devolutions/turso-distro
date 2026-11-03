@@ -219,6 +219,22 @@ pub trait File: Send + Sync {
         ))
     }
 
+    /// Try to lock `len` bytes at `offset` without waiting, the way SQLite's
+    /// own VFS locks a rollback-journal database. Returns false when another
+    /// process (or another handle) holds a conflicting lock.
+    fn try_lock_range(&self, _offset: u64, _len: u64, _exclusive: bool) -> Result<bool> {
+        Err(crate::LimboError::LockingError(
+            "byte-range locks are not supported by this IO backend".into(),
+        ))
+    }
+
+    /// Release a lock taken with [`File::try_lock_range`] on the same range.
+    fn unlock_range(&self, _offset: u64, _len: u64) -> Result<()> {
+        Err(crate::LimboError::LockingError(
+            "byte-range locks are not supported by this IO backend".into(),
+        ))
+    }
+
     fn shared_wal_lock_byte(
         &self,
         _offset: u64,

@@ -1000,7 +1000,9 @@ impl Connection {
         if self.get_tx_state() != TransactionState::None {
             return Ok(false);
         }
-        if self.db.shared_wal_coordination()?.is_none() {
+        // Other processes change the schema only in multiprocess WAL mode or
+        // in rollback-journal mode.
+        if self.db.shared_wal_coordination()?.is_none() && !self.db.in_rollback_journal_mode() {
             return Ok(false);
         }
         self.maybe_reparse_schema()?;
@@ -1108,6 +1110,16 @@ impl Connection {
         let result = (|| {
             let sql = sql.as_ref();
             tracing::debug!("Preparing: {}", sql);
+
+            // The schema of a rollback-journal database is not read at open
+            // while a SQLite writer holds EXCLUSIVE; read it now (`Busy`
+            // until the writer is done), as SQLite's prepare does.
+            if self.db.in_rollback_journal_mode()
+                && self.schema.read().schema_version == 0
+                && origin == StatementOrigin::Root
+            {
+                self.maybe_reparse_schema()?;
+            }
 
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
@@ -2493,10 +2505,13 @@ impl Connection {
             .wal
             .as_ref()
             .is_none_or(|wal| wal.should_checkpoint_on_close());
+        // In rollback-journal mode every commit already emptied the WAL, and
+        // the database file is changed only under SQLite's EXCLUSIVE lock.
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
             && !self.db.is_readonly()
             && !is_memory_db
             && should_checkpoint_on_close
+            && !self.db.in_rollback_journal_mode()
         {
             self.pager
                 .load()

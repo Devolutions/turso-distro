@@ -6128,7 +6128,6 @@ impl WalFileShared {
     /// replacing the lock objects would make normal `end_read_tx` unlock a
     /// fresh empty lock. Keep lock identity stable and refresh only state
     /// derived from storage.
-    #[cfg(feature = "conn_raw_api")]
     pub fn replace_after_external_restore(&mut self, restored: WalFileShared) {
         self.metadata = restored.metadata;
         self.runtime.frame_cache = restored.runtime.frame_cache;

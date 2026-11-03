@@ -105,6 +105,11 @@ pub struct Opts {
     pub experimental_index_method: bool,
     #[clap(long, help = "Enable experimental autovacuum feature")]
     pub experimental_autovacuum: bool,
+    #[clap(
+        long,
+        help = "Keep a rollback-journal database in rollback-journal mode, with SQLite's file locks"
+    )]
+    pub rollback_journal: bool,
     #[clap(long, help = "Enable experimental vacuum feature")]
     pub experimental_vacuum: bool,
     #[clap(long, help = "Enable experimental attach feature")]
@@ -259,6 +264,7 @@ impl Limbo {
             .with_encryption(opts.experimental_encryption)
             .with_index_method(opts.experimental_index_method)
             .with_autovacuum(opts.experimental_autovacuum)
+            .with_rollback_journal(opts.rollback_journal)
             .with_vacuum(opts.experimental_vacuum)
             .with_attach(opts.experimental_attach)
             .with_without_rowid(opts.experimental_without_rowid)
