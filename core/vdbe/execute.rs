@@ -10510,6 +10510,29 @@ pub fn op_function(
                 );
                 state.registers[*dest].set_text(Text::new(src_id))?;
             }
+            ScalarFunc::AlterTableSql => {
+                assert_eq!(arg_count, 4);
+                let text = |offset: usize| match state.registers[*start_reg + offset].get_value() {
+                    Value::Text(text) => Some(text.as_str().to_string()),
+                    _ => None,
+                };
+                let (Some(op), Some(rendered), Some(arg)) = (text(0), text(2), text(3)) else {
+                    return Err(LimboError::InternalError(
+                        "turso_alter_table_sql() takes TEXT arguments".to_string(),
+                    )
+                    .into());
+                };
+                let sql = match text(1) {
+                    Some(old) if op == "add" => {
+                        crate::schema_text::add_column_sql(&old, &arg, rendered)
+                    }
+                    Some(old) if op == "drop" => {
+                        crate::schema_text::drop_column_sql(&old, &arg, rendered)
+                    }
+                    _ => rendered,
+                };
+                state.registers[*dest].set_text(Text::new(sql))?;
+            }
             ScalarFunc::Replace => {
                 assert_eq!(arg_count, 3);
                 let source = &state.registers[*start_reg];
@@ -11481,6 +11504,8 @@ pub fn op_function(
 
             let sql = &state.registers[*start_reg + 4].get_value().clone();
 
+            // The new name as the ALTER TABLE statement wrote it.
+            let written_new_name: String;
             let (new_name, new_tbl_name, new_sql) = match alter_func {
                 AlterTableFunc::RenameTable => {
                     let rename_from = {
@@ -11497,6 +11522,9 @@ pub fn op_function(
                         }
                     };
                     let rename_to = normalize_ident(original_rename_to.as_str());
+                    // SQLite always quotes a renamed table's name.
+                    written_new_name =
+                        format!("\"{}\"", original_rename_to.as_str().replace('"', "\"\""));
 
                     // Rows keep names as written (SQLite, or this engine since it
                     // stopped lowercasing them), so match them case-insensitively
@@ -11809,6 +11837,7 @@ pub fn op_function(
 
                     let column_def =
                         Parser::new(column_def.as_bytes()).parse_column_definition(true)?;
+                    written_new_name = column_def.col_name.as_ident();
 
                     let _rename_to = normalize_ident(column_def.col_name.as_str());
 
@@ -12073,6 +12102,18 @@ pub fn op_function(
             state.registers[*dest + 3].set_int(*root_page);
 
             if let Some(new_sql) = new_sql {
+                // Keep the stored text as written apart from the renamed
+                // names, as SQLite does.
+                let new_sql = match sql {
+                    Value::Text(old_sql) if program.connection.db.in_rollback_journal_mode() => {
+                        crate::schema_text::renamed_sql(
+                            old_sql.as_str(),
+                            new_sql,
+                            Some(&written_new_name),
+                        )
+                    }
+                    _ => new_sql,
+                };
                 state.registers[*dest + 4].set_text(Text::from(new_sql))?;
             } else {
                 state.registers[*dest + 4].set_value(sql.clone());

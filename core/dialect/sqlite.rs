@@ -474,6 +474,7 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "conn_txn_id" => Ok(Some(Func::Scalar(ScalarFunc::ConnTxnId))),
         "is_autocommit" => Ok(Some(Func::Scalar(ScalarFunc::IsAutocommit))),
         "sequence_watermark_experimental" => Ok(Some(Func::Scalar(ScalarFunc::SequenceWatermark))),
+        "turso_alter_table_sql" => Ok(Some(Func::Scalar(ScalarFunc::AlterTableSql))),
         "acos" => Ok(Some(Func::Math(MathFunc::Acos))),
         "acosh" => Ok(Some(Func::Math(MathFunc::Acosh))),
         "asin" => Ok(Some(Func::Math(MathFunc::Asin))),

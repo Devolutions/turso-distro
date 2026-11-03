@@ -862,6 +862,17 @@ pub fn translate_alter_table(
         name: qualified_name,
         body: alter_table,
     } = alter;
+    // A database kept in rollback-journal mode for SQLite edits the stored
+    // text in place, as SQLite does, instead of rendering it again (see
+    // `schema_text`).
+    let keep_source_text = connection.db.in_rollback_journal_mode();
+    let carry_renames = |old: &str, new: String, written: Option<&str>| {
+        if keep_source_text {
+            crate::schema_text::renamed_sql(old, new, written)
+        } else {
+            new
+        }
+    };
     let database_id = resolver.resolve_existing_table_database_id_qualified(&qualified_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
@@ -1156,12 +1167,19 @@ pub fn translate_alter_table(
             btree.columns_mut().remove(dropped_index);
 
             let sql = escape_sql_string_literal(&btree.to_sql());
+            let escaped_column_name = escape_sql_string_literal(column_name);
 
+            // The stored text loses the column's text, as SQLite edits it.
+            let new_sql = if keep_source_text {
+                format!("turso_alter_table_sql('drop', sql, '{sql}', '{escaped_column_name}')")
+            } else {
+                format!("'{sql}'")
+            };
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
                 r#"
                     UPDATE {qualified_schema_table}
-                    SET sql = '{sql}'
+                    SET sql = {new_sql}
                     WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
                 "#,
             );
@@ -1447,10 +1465,22 @@ pub fn translate_alter_table(
 
             let escaped = escape_sql_string_literal(&btree.to_sql());
             let escaped_table_name = escape_sql_string_literal(table_name);
+            // The column definition goes into the stored text as written,
+            // as SQLite edits it.
+            let column_def = keep_source_text
+                .then(|| crate::schema_text::added_column_text(input))
+                .flatten();
+            let new_sql = match column_def {
+                Some(column_def) => format!(
+                    "turso_alter_table_sql('add', sql, '{escaped}', '{}')",
+                    escape_sql_string_literal(&column_def)
+                ),
+                None => format!("'{escaped}'"),
+            };
             let stmt = format!(
                 r#"
                     UPDATE {qualified_schema_table}
-                    SET sql = '{escaped}'
+                    SET sql = {new_sql}
                     WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
                 "#,
             );
@@ -1620,12 +1650,16 @@ pub fn translate_alter_table(
                     let renamed_db_name = resolver
                         .get_database_name_by_index(database_id)
                         .unwrap_or_else(|| "main".to_string());
-                    let new_sql = rewrite_trigger_sql_for_table_rename(
+                    let new_sql = carry_renames(
                         &trigger_entry.trigger.sql,
-                        table_name,
-                        new_name,
-                        &renamed_db_name,
-                    )?;
+                        rewrite_trigger_sql_for_table_rename(
+                            &trigger_entry.trigger.sql,
+                            table_name,
+                            new_name,
+                            &renamed_db_name,
+                        )?,
+                        Some(&format!("\"{}\"", new_name.replace('"', "\"\""))),
+                    );
                     if new_sql != trigger_entry.trigger.sql {
                         temp_triggers_to_rewrite.push((
                             trigger_entry.trigger.name.clone(),
@@ -1838,6 +1872,7 @@ pub fn translate_alter_table(
             }
 
             let from = from.as_str();
+            let written_col_name = col_name.as_ident();
             let col_name = col_name.as_str();
 
             let Some((column_index, _)) = btree.get_column(from) else {
@@ -2040,6 +2075,11 @@ pub fn translate_alter_table(
                         resolver,
                     ) {
                         Ok(new_sql) => {
+                            let new_sql = carry_renames(
+                                &trigger_entry.trigger.sql,
+                                new_sql,
+                                Some(&written_col_name),
+                            );
                             if new_sql != trigger_entry.trigger.sql {
                                 triggers_to_rewrite.push((
                                     trigger_entry.database_id,
@@ -2091,7 +2131,11 @@ pub fn translate_alter_table(
                             from,
                             col_name,
                         )? {
-                            rewrites.push((database_id, view_name.clone(), rewritten.sql));
+                            rewrites.push((
+                                database_id,
+                                view_name.clone(),
+                                carry_renames(&view.sql, rewritten.sql, Some(&written_col_name)),
+                            ));
                         }
                     }
                     Ok(rewrites)
@@ -2114,7 +2158,11 @@ pub fn translate_alter_table(
                                     rewrites.push((
                                         crate::TEMP_DB_ID,
                                         view_name.clone(),
-                                        rewritten.sql,
+                                        carry_renames(
+                                            &view.sql,
+                                            rewritten.sql,
+                                            Some(&written_col_name),
+                                        ),
                                     ));
                                 }
                             }

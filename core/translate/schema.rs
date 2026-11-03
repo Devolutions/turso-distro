@@ -454,6 +454,7 @@ fn resolve_scalar_func_return_type(
         | ScalarFunc::Soundex
         | ScalarFunc::Quote
         | ScalarFunc::Replace
+        | ScalarFunc::AlterTableSql
         | ScalarFunc::Substr
         | ScalarFunc::Substring
         | ScalarFunc::Char
@@ -1351,9 +1352,16 @@ pub fn translate_create_table(
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
     } else {
-        connection
+        let sql = connection
             .dialect()
-            .format_table_sql(input, &tbl_name, &body)?
+            .format_table_sql(input, &tbl_name, &body)?;
+        // A database kept in rollback-journal mode for SQLite stores the
+        // statement as written, as SQLite does.
+        if connection.db.in_rollback_journal_mode() {
+            crate::schema_text::create_sql(input, sql)
+        } else {
+            sql
+        }
     };
 
     let parse_schema_label = program.allocate_label();

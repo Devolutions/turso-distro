@@ -313,6 +313,7 @@ fn validate_create_view(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate_create_view(
     view_name: &ast::QualifiedName,
     resolver: &Resolver,
@@ -321,6 +322,7 @@ pub fn translate_create_view(
     temporary: bool,
     if_not_exists: bool,
     program: &mut ProgramBuilder,
+    source_text: Option<&str>,
 ) -> Result<()> {
     // TEMP views always live in the temp schema. The parser rejects
     // CREATE TEMP VIEW with a database name other than "temp".
@@ -379,8 +381,13 @@ pub fn translate_create_view(
 
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
 
-    // Reconstruct the SQL string
+    // Reconstruct the SQL string, or keep the statement as written, as
+    // SQLite does, when asked for.
     let sql = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);
+    let sql = match source_text {
+        Some(input) => crate::schema_text::create_sql(input, sql),
+        None => sql,
+    };
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();

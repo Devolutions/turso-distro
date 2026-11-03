@@ -87,8 +87,14 @@ pub fn translate_create_index(
     connection: &Arc<crate::Connection>,
     resolver: &Resolver,
     stmt: ast::Stmt,
+    source_text: Option<&str>,
 ) -> crate::Result<()> {
     let sql = canonical_create_index_sql(&stmt);
+    // The statement as written, as SQLite keeps it, when asked for.
+    let sql = match source_text {
+        Some(input) => crate::schema_text::create_sql(input, sql),
+        None => sql,
+    };
     let ast::Stmt::CreateIndex {
         unique,
         if_not_exists,

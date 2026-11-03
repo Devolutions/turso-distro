@@ -74,6 +74,7 @@ mod progress;
 mod pseudo;
 mod regexp;
 #[cfg(feature = "series")]
+mod schema_text;
 mod series;
 mod stack;
 mod statement;
