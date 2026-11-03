@@ -659,6 +659,43 @@ fn sdk_execute(db: &turso_sdk_kit::rsapi::TursoDatabase, sql: &str) {
     }
 }
 
+/// A database Turso creates in rollback-journal mode is a rollback-journal
+/// database, as SQLite creates one: from a missing file or an empty one.
+#[test]
+fn test_rollback_journal_new_database_starts_in_rollback_journal_mode() {
+    for empty_file in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("new.db");
+        if empty_file {
+            std::fs::write(&path, b"").unwrap();
+        }
+        {
+            let db = open_in_sdk(&path, OpenFlags::Create, "autovacuum,rollback_journal").unwrap();
+            sdk_execute(
+                &db,
+                "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT); INSERT INTO t(b) VALUES ('from turso')",
+            );
+            assert_eq!(header_versions(&path), (1, 1), "empty_file={empty_file}");
+            assert!(!has_side_file(&path, "-wal"), "empty_file={empty_file}");
+        }
+        assert!(!wal_path(&path).exists(), "empty_file={empty_file}");
+        assert!(
+            !side_file(&path, "-shm").exists(),
+            "empty_file={empty_file}"
+        );
+        assert_eq!(header_versions(&path), (1, 1), "empty_file={empty_file}");
+        assert_eq!(
+            sqlite_sees(&path),
+            (
+                "delete".to_string(),
+                "ok".to_string(),
+                rows(&["from turso"])
+            ),
+            "empty_file={empty_file}"
+        );
+    }
+}
+
 /// Without `OpenFlags::Create`, an existing database opens read-write, as
 /// with SQLITE_OPEN_READWRITE; only a missing database file fails.
 #[test]
@@ -682,3 +719,22 @@ fn test_open_existing_database_without_create() {
     }
 }
 
+/// The option does not apply to in-memory databases, which have no file to
+/// lock.
+#[test]
+fn test_rollback_journal_option_on_in_memory_database() {
+    let db = Database::open_file_with_flags(
+        Arc::new(turso_core::MemoryIO::new()),
+        ":memory:",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_rollback_journal(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("INSERT INTO t VALUES ('in memory')").unwrap();
+    assert_eq!(turso_texts(&conn, "SELECT a FROM t"), rows(&["in memory"]));
+    assert_eq!(turso_texts(&conn, "PRAGMA journal_mode"), rows(&["wal"]));
+}
