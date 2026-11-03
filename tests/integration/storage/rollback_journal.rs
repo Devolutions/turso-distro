@@ -626,3 +626,59 @@ fn test_rollback_journal_vacuum() {
     );
     assert_eq!(turso_texts(&conn, "SELECT b FROM t ORDER BY a"), expected);
 }
+
+/// Opens a database through the SDK kit with `features`, as the RDM devo
+/// does.
+fn open_in_sdk(
+    path: &Path,
+    flags: OpenFlags,
+    features: &str,
+) -> Result<Arc<turso_sdk_kit::rsapi::TursoDatabase>, turso_sdk_kit::rsapi::TursoError> {
+    let db = turso_sdk_kit::rsapi::TursoDatabase::new(turso_sdk_kit::rsapi::TursoDatabaseConfig {
+        path: path.to_str().unwrap().to_string(),
+        experimental_features: Some(features.to_string()),
+        async_io: false,
+        encryption: None,
+        vfs: turso::IoBackend::Default,
+        io: None,
+        db_file: None,
+        page_codec: None,
+        open_flags: flags,
+    });
+    let _ = db.open()?;
+    Ok(db)
+}
+
+fn sdk_execute(db: &turso_sdk_kit::rsapi::TursoDatabase, sql: &str) {
+    let conn = db.connect().unwrap();
+    for statement in sql.split(';').filter(|s| !s.trim().is_empty()) {
+        conn.prepare_single(statement)
+            .unwrap()
+            .execute(None)
+            .unwrap();
+    }
+}
+
+/// Without `OpenFlags::Create`, an existing database opens read-write, as
+/// with SQLITE_OPEN_READWRITE; only a missing database file fails.
+#[test]
+fn test_open_existing_database_without_create() {
+    for features in ["autovacuum,rollback_journal", "autovacuum"] {
+        let dir = TempDir::new().unwrap();
+        let path = create_rollback_journal_database(dir.path());
+        {
+            let db = open_in_sdk(&path, OpenFlags::None, features)
+                .unwrap_or_else(|err| panic!("features={features}: {err:?}"));
+            sdk_execute(&db, "INSERT INTO t(b) VALUES ('from turso')");
+        }
+        assert_eq!(
+            sqlite_sees(&path).2,
+            rows(&["from sqlite", "from turso"]),
+            "features={features}"
+        );
+        let missing = dir.path().join("missing.db");
+        assert!(open_in_sdk(&missing, OpenFlags::None, features).is_err());
+        assert!(!missing.exists());
+    }
+}
+

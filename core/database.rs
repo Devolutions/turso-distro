@@ -2084,6 +2084,17 @@ impl Database {
         }
     }
 
+    /// Flags to open the WAL file with. Like SQLite's journal, it is created
+    /// whenever the database is writable, also when the database file itself
+    /// had to exist (no `OpenFlags::Create`).
+    fn wal_open_flags(&self) -> OpenFlags {
+        if self.open_flags.contains(OpenFlags::ReadOnly) {
+            self.open_flags
+        } else {
+            self.open_flags | OpenFlags::Create
+        }
+    }
+
     /// Whether the database stays in rollback-journal mode, with SQLite's
     /// file locks (see [`DatabaseOpts::with_rollback_journal`]).
     pub(crate) fn in_rollback_journal_mode(&self) -> bool {
@@ -2114,7 +2125,7 @@ impl Database {
             file,
             &self.path,
             &self.wal_path,
-            self.open_flags,
+            self.wal_open_flags(),
         );
         self.pager_state
             .rollback_journal
@@ -2430,7 +2441,7 @@ impl Database {
                                 *driver = Some(WalFileShared::open_shared_if_exists_begin(
                                     &self.io,
                                     &self.wal_path,
-                                    self.open_flags,
+                                    self.wal_open_flags(),
                                 )?);
                             }
                             return_if_io!(driver.as_mut().expect("driver initialized above").poll())
@@ -2441,7 +2452,7 @@ impl Database {
                             // synchronously here, so the blocking shims are
                             // fine. (Driver field is unused on host.)
                             let _ = &driver;
-                            let flags = self.open_flags;
+                            let flags = self.wal_open_flags();
                             let shared_authority = self.open_shared_wal_coordination_for_open()?;
                             if let Some(authority) = shared_authority.as_ref() {
                                 if !authority.frame_index_overflowed() {
@@ -2581,7 +2592,7 @@ impl Database {
                     .to_string(),
             ));
         }
-        let flags = self.open_flags;
+        let flags = self.wal_open_flags();
         #[cfg(host_shared_wal)]
         let shared_authority = self.open_shared_wal_coordination_for_open()?;
         #[cfg(not(host_shared_wal))]
