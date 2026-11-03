@@ -19002,9 +19002,16 @@ fn op_journal_mode_inner(
                 };
 
                 // Parse the new mode. If unknown or unsupported, silently return
-                // current mode (matches SQLite behavior).
+                // current mode (matches SQLite behavior). A database kept in
+                // rollback-journal mode for SQLite stays in it.
                 let new_mode = match journal_mode::JournalMode::from_str(mode_str.as_str()) {
-                    Ok(mode) if mode.supported() => mode,
+                    Ok(mode)
+                        if mode.supported()
+                            && !(*db == crate::MAIN_DB_ID
+                                && program.connection.db.in_rollback_journal_mode()) =>
+                    {
+                        mode
+                    }
                     _ => {
                         let ret: &'static str = prev_mode.into();
                         state.registers[*dest].set_text(Text::new(ret))?;

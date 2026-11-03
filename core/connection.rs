@@ -584,22 +584,6 @@ crate::assert::assert_send_sync!(Connection);
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        // Bindings such as the Rust crate drop connections without closing
-        // them. A database that goes back to rollback-journal mode needs the
-        // checkpoint that close() runs for the last connection, so dropping
-        // one closes it.
-        if !self.is_closed()
-            && self.db.opts.restore_rollback_journal
-            && self
-                .db
-                .opened_in_rollback_journal_mode
-                .load(Ordering::SeqCst)
-        {
-            if let Err(err) = self.close() {
-                tracing::warn!("closing a dropped connection failed: {err}");
-            }
-            return;
-        }
         if !self.is_closed() {
             // A handle dropped mid-transaction rolls that transaction back
             // below, so parked index-method cursors must receive the same
@@ -1007,7 +991,9 @@ impl Connection {
         if self.get_tx_state() != TransactionState::None {
             return Ok(false);
         }
-        if self.db.shared_wal_coordination()?.is_none() {
+        // Other processes change the schema only in multiprocess WAL mode or
+        // in rollback-journal mode.
+        if self.db.shared_wal_coordination()?.is_none() && !self.db.in_rollback_journal_mode() {
             return Ok(false);
         }
         self.maybe_reparse_schema()?;
@@ -1118,6 +1104,16 @@ impl Connection {
         let result = (|| {
             let sql = sql.as_ref();
             tracing::debug!("Preparing: {}", sql);
+
+            // The schema of a rollback-journal database is not read at open
+            // while a SQLite writer holds EXCLUSIVE; read it now (`Busy`
+            // until the writer is done), as SQLite's prepare does.
+            if self.db.in_rollback_journal_mode()
+                && self.schema.read().schema_version == 0
+                && origin == StatementOrigin::Root
+            {
+                self.maybe_reparse_schema()?;
+            }
 
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
@@ -2466,26 +2462,17 @@ impl Connection {
             .wal
             .as_ref()
             .is_none_or(|wal| wal.should_checkpoint_on_close());
+        // In rollback-journal mode every commit already emptied the WAL, and
+        // the database file is changed only under SQLite's EXCLUSIVE lock.
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
             && !self.db.is_readonly()
             && !is_memory_db
             && should_checkpoint_on_close
+            && !self.db.in_rollback_journal_mode()
         {
-            let pager = self.pager.load();
-            pager.checkpoint_shutdown(self.wal_auto_actions(), self.get_sync_mode())?;
-            if self.db.opts.restore_rollback_journal
-                && !self.db.opts.enable_multiprocess_wal
-                && self
-                    .db
-                    .opened_in_rollback_journal_mode
-                    .load(Ordering::SeqCst)
-                && self.db.get_mv_store().is_none()
-                && pager.restore_rollback_journal_header()?
-            {
-                self.db
-                    .rollback_journal_restored
-                    .store(true, Ordering::SeqCst);
-            }
+            self.pager
+                .load()
+                .checkpoint_shutdown(self.wal_auto_actions(), self.get_sync_mode())?;
         };
         Ok(())
     }

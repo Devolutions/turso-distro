@@ -4,6 +4,7 @@ use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
 use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
+use crate::storage::rollback_journal::{FileVersion, LockLevel, RollbackJournal};
 use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::{CheckpointLockSource, PreparedFrames};
 use crate::storage::{
@@ -1581,6 +1582,9 @@ pub struct SharedPagerState {
     init_lock: Mutex<()>,
     init_page_1: ArcSwapOption<Page>,
     page_size: AtomicU32,
+    /// Set when the database stays in rollback-journal mode, with SQLite's
+    /// file locks (see `DatabaseOpts::with_rollback_journal`).
+    pub(crate) rollback_journal: ArcSwapOption<RollbackJournal>,
 }
 
 impl SharedPagerState {
@@ -1595,6 +1599,7 @@ impl SharedPagerState {
             init_lock: Mutex::new(()),
             init_page_1: ArcSwapOption::new(init_page_1),
             page_size: AtomicU32::new(page_size),
+            rollback_journal: ArcSwapOption::empty(),
         }
     }
 
@@ -1673,6 +1678,14 @@ pub struct Pager {
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
     shared: Arc<SharedPagerState>,
+    /// The rollback-journal file lock this pager holds (a `LockLevel`).
+    rollback_journal_lock: AtomicU8,
+    /// The file version seen at the start of the last read transaction in
+    /// rollback-journal mode; a different one means another process changed
+    /// the database and the page cache is stale.
+    rollback_journal_version: Mutex<Option<FileVersion>>,
+    /// The commit being prepared has incremented the change counter.
+    rollback_journal_counter_bumped: AtomicBool,
     /// Sync type for durability. FullFsync uses F_FULLFSYNC on macOS (PRAGMA fullfsync).
     /// Only stored on Apple platforms; on others, always returns Fsync.
     #[cfg(target_vendor = "apple")]
@@ -1986,6 +1999,9 @@ impl Pager {
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
             shared,
+            rollback_journal_lock: AtomicU8::new(LockLevel::None as u8),
+            rollback_journal_version: Mutex::new(None),
+            rollback_journal_counter_bumped: AtomicBool::new(false),
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
@@ -3024,10 +3040,22 @@ impl Pager {
     #[inline(always)]
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     pub fn begin_read_tx(&self) -> Result<()> {
+        let locked_now = match self.shared.rollback_journal.load_full() {
+            Some(journal) => self.begin_rollback_journal_read(&journal)?,
+            None => false,
+        };
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
-        let changed = wal.begin_read_tx()?;
+        let changed = match wal.begin_read_tx() {
+            Ok(changed) => changed,
+            Err(err) => {
+                if locked_now {
+                    self.end_rollback_journal_tx();
+                }
+                return Err(err);
+            }
+        };
         if changed {
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
             self.clear_page_cache(false);
@@ -3035,6 +3063,227 @@ impl Pager {
             self.set_schema_cookie(None);
         }
         Ok(())
+    }
+
+    /// Whether the database stays in rollback-journal mode, with SQLite's
+    /// file locks.
+    pub(crate) fn shared_rollback_journal_mode(&self) -> bool {
+        self.shared.rollback_journal.load().is_some()
+    }
+
+    fn rollback_journal_level(&self) -> LockLevel {
+        LockLevel::from_u8(self.rollback_journal_lock.load(Ordering::Acquire))
+    }
+
+    fn set_rollback_journal_level(&self, level: LockLevel) {
+        self.rollback_journal_lock
+            .store(level as u8, Ordering::Release);
+    }
+
+    /// Identifies this pager to the process-wide lock state.
+    fn rollback_journal_owner(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    /// Takes SHARED at the start of a read transaction in rollback-journal
+    /// mode. Returns whether the lock was taken now rather than already held.
+    fn begin_rollback_journal_read(&self, journal: &RollbackJournal) -> Result<bool> {
+        if self.rollback_journal_level() != LockLevel::None {
+            return Ok(false);
+        }
+        journal.lock_shared()?;
+        self.set_rollback_journal_level(LockLevel::Shared);
+        if let Err(err) = self.refresh_rollback_journal_database(journal) {
+            self.end_rollback_journal_tx();
+            return Err(err);
+        }
+        Ok(true)
+    }
+
+    /// Makes the database file current for a reader holding SHARED: rolls
+    /// back the hot journal of a SQLite writer that died, checkpoints a WAL
+    /// that a crash left frames in, and drops the page cache when another
+    /// process changed the file since this pager last read it.
+    fn refresh_rollback_journal_database(&self, journal: &RollbackJournal) -> Result<()> {
+        let wal_has_frames = journal.wal_has_frames();
+        if wal_has_frames || journal.has_hot_journal()? {
+            if journal.is_read_only() {
+                // Only a writer can repair the file; wait for one.
+                return Err(LimboError::Busy);
+            }
+            let owner = self.rollback_journal_owner();
+            journal.lock_exclusive(owner)?;
+            self.set_rollback_journal_level(LockLevel::Exclusive);
+            if journal.has_hot_journal()? {
+                journal.roll_back_hot_journal()?;
+            }
+            if wal_has_frames {
+                self.checkpoint_leftover_wal(journal)?;
+            }
+            journal.unlock_exclusive(owner);
+            self.set_rollback_journal_level(LockLevel::Shared);
+            *self.rollback_journal_version.lock() = None;
+        }
+        let version = journal.read_file_version()?;
+        let mut seen = self.rollback_journal_version.lock();
+        if *seen != Some(version) {
+            self.clear_page_cache(false);
+            self.set_schema_cookie(None);
+            *seen = Some(version);
+        }
+        Ok(())
+    }
+
+    /// Checkpoints the frames a crash left in the WAL into the database file
+    /// and empties the WAL. The caller holds EXCLUSIVE.
+    fn checkpoint_leftover_wal(&self, journal: &RollbackJournal) -> Result<()> {
+        let Some(wal) = self.wal.as_ref() else {
+            return Err(LimboError::Busy);
+        };
+        tracing::info!("checkpointing frames a crash left in the WAL");
+        journal.reload_wal()?;
+        let mode = CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        };
+        self.io
+            .block(|| self.checkpoint(mode, SyncMode::Full, true))
+            .inspect_err(|_| self.cleanup_after_checkpoint_failure())?;
+        // Frames without a commit are not checkpointed, and a WAL holding
+        // only those is not truncated.
+        if wal.wal_file()?.size()? > 0 {
+            self.truncate_rollback_journal_wal(journal)?;
+        }
+        Ok(())
+    }
+
+    /// Empties the WAL file and resets the WAL state to match.
+    fn truncate_rollback_journal_wal(&self, journal: &RollbackJournal) -> Result<()> {
+        let Some(wal) = self.wal.as_ref() else {
+            return Ok(());
+        };
+        let c = wal.wal_file()?.truncate(0, Completion::new_trunc(|_| {}))?;
+        self.io.wait_for_completion(c)?;
+        journal.reload_wal()
+    }
+
+    fn lock_rollback_journal_for_vacuum(&self, journal: &RollbackJournal) -> Result<()> {
+        let owner = self.rollback_journal_owner();
+        let result = (|| {
+            if self.rollback_journal_level() == LockLevel::None {
+                self.begin_rollback_journal_read(journal)?;
+            }
+            if self.rollback_journal_level() < LockLevel::Reserved {
+                journal.lock_reserved(owner)?;
+                self.set_rollback_journal_level(LockLevel::Reserved);
+            }
+            journal.lock_exclusive(owner)?;
+            self.set_rollback_journal_level(LockLevel::Exclusive);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.end_rollback_journal_tx();
+        }
+        result
+    }
+
+    /// After VACUUM rewrote a rollback-journal database: increments the
+    /// change counter, which the new image may carry over unchanged, so that
+    /// SQLite drops its cached pages, and releases the locks.
+    pub(crate) fn finish_rollback_journal_vacuum(&self) -> Result<()> {
+        let Some(journal) = self.shared.rollback_journal.load_full() else {
+            return Ok(());
+        };
+        let result = if self.rollback_journal_level() == LockLevel::Exclusive {
+            journal.increment_change_counter()
+        } else {
+            Ok(())
+        };
+        self.clear_page_cache(false);
+        *self.rollback_journal_version.lock() = None;
+        self.end_rollback_journal_tx();
+        result
+    }
+
+    /// Before a commit in rollback-journal mode writes its first frame: takes
+    /// EXCLUSIVE, which waits for readers to finish (`Busy` until then), and
+    /// increments the change counter so that SQLite drops its cached pages.
+    fn prepare_rollback_journal_commit(&self, journal: &RollbackJournal) -> IOResultOr<()> {
+        if self.rollback_journal_counter_bumped.load(Ordering::Acquire)
+            || self.dirty_pages.read().is_empty()
+        {
+            return Ok(IOResult::Done(()));
+        }
+        journal.lock_exclusive(self.rollback_journal_owner())?;
+        self.set_rollback_journal_level(LockLevel::Exclusive);
+        return_if_io!(self.with_header_mut(|header| {
+            let counter = header.change_counter.get().wrapping_add(1);
+            header.change_counter = pack1::U32BE::new(counter);
+            header.version_valid_for = pack1::U32BE::new(counter);
+        }));
+        self.rollback_journal_counter_bumped
+            .store(true, Ordering::Release);
+        Ok(IOResult::Done(()))
+    }
+
+    /// After a commit in rollback-journal mode has been checkpointed:
+    /// remembers the file version it wrote, so that this pager keeps its
+    /// cache, and releases its locks.
+    fn finish_rollback_journal_commit(&self) {
+        let Some(journal) = self.shared.rollback_journal.load_full() else {
+            return;
+        };
+        if self.rollback_journal_level() == LockLevel::Exclusive {
+            if journal.wal_has_frames() {
+                // The auto-checkpoint failed: try once more before SQLite can
+                // see the WAL. If that fails too, the frames stay, and both
+                // SQLite and the next Turso reader recover them.
+                let mode = CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                };
+                if let Err(err) = self
+                    .io
+                    .block(|| self.checkpoint(mode, SyncMode::Full, false))
+                {
+                    self.cleanup_after_checkpoint_failure();
+                    tracing::warn!(
+                        "the WAL still holds frames after a rollback-journal commit: {err}"
+                    );
+                }
+            }
+            *self.rollback_journal_version.lock() = journal.read_file_version().ok();
+        }
+        self.end_rollback_journal_tx();
+    }
+
+    /// Releases this pager's rollback-journal locks at the end of a
+    /// transaction. Frames of a transaction that did not commit are
+    /// discarded first, so that SQLite never sees them; committed frames that
+    /// are not in the database file yet are kept.
+    pub(crate) fn end_rollback_journal_tx(&self) {
+        let level = self.rollback_journal_level();
+        if level == LockLevel::None {
+            return;
+        }
+        let Some(journal) = self.shared.rollback_journal.load_full() else {
+            return;
+        };
+        let committed_frames_backfilled = self
+            .wal
+            .as_ref()
+            .is_some_and(|wal| wal.get_max_frame_in_wal() <= wal.backfill_frame());
+        if level == LockLevel::Exclusive && journal.wal_has_frames() && committed_frames_backfilled
+        {
+            if let Err(err) = self.truncate_rollback_journal_wal(&journal) {
+                tracing::error!("emptying the WAL after a failed commit failed: {err}");
+            }
+        }
+        let owner = self.rollback_journal_owner();
+        journal.unlock_exclusive(owner);
+        journal.unlock_reserved(owner);
+        journal.unlock_shared();
+        self.set_rollback_journal_level(LockLevel::None);
+        self.rollback_journal_counter_bumped
+            .store(false, Ordering::Release);
     }
 
     /// MVCC-only: refresh connection-private WAL change counters without starting a read tx and invalidate cache if needed.
@@ -3077,6 +3326,21 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
         wal.begin_write_tx(allowed_auto_actions)?;
+        if let Some(journal) = self.shared.rollback_journal.load_full() {
+            if self.rollback_journal_level() < LockLevel::Reserved {
+                if self.rollback_journal_level() == LockLevel::None {
+                    if let Err(err) = self.begin_rollback_journal_read(&journal) {
+                        wal.end_write_tx();
+                        return Err(err.into());
+                    }
+                }
+                if let Err(err) = journal.lock_reserved(self.rollback_journal_owner()) {
+                    wal.end_write_tx();
+                    return Err(err.into());
+                }
+                self.set_rollback_journal_level(LockLevel::Reserved);
+            }
+        }
         // Must run after the upgrade (and any log restart it performed) so
         // the positions belong to the current WAL generation.
         self.materialize_savepoint_wal_positions();
@@ -3119,7 +3383,15 @@ impl Pager {
         let wal = self.wal.as_ref().ok_or_else(|| {
             LimboError::InternalError("begin_vacuum_blocking_tx requires WAL mode".into())
         })?;
-        wal.begin_vacuum_blocking_tx()?;
+        // VACUUM rewrites the database file through the WAL: in
+        // rollback-journal mode it holds EXCLUSIVE from the start.
+        if let Some(journal) = self.shared.rollback_journal.load_full() {
+            self.lock_rollback_journal_for_vacuum(&journal)?;
+        }
+        if let Err(err) = wal.begin_vacuum_blocking_tx() {
+            self.end_rollback_journal_tx();
+            return Err(err.into());
+        }
         // let's be conservative and clear all cache for vacuum
         // todo: clear cache only if we detect that new writes have occurred like `begin_read_tx`
         self.clear_page_cache(false);
@@ -3146,8 +3418,10 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             self.clear_savepoints()?;
+            self.end_rollback_journal_tx();
             return Ok(IOResult::Done(()));
         };
+        let rollback_journal = self.shared.rollback_journal.load_full();
 
         let complete_commit = || {
             if update_transaction_state {
@@ -3164,13 +3438,18 @@ impl Pager {
             // otherwise, we will be unable to do WAL restart
             match commit_state {
                 CommitState::AutoCheckpoint => {
-                    let checkpoint_result = self.checkpoint(
+                    // In rollback-journal mode the WAL is emptied before the
+                    // database file is handed back to SQLite.
+                    let mode = if rollback_journal.is_some() {
+                        CheckpointMode::Truncate {
+                            upper_bound_inclusive: None,
+                        }
+                    } else {
                         CheckpointMode::Passive {
                             upper_bound_inclusive: None,
-                        },
-                        sync_mode,
-                        false,
-                    );
+                        }
+                    };
+                    let checkpoint_result = self.checkpoint(mode, sync_mode, false);
                     match checkpoint_result {
                         Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                         Ok(IOResult::Done(_)) => complete_commit(),
@@ -3180,20 +3459,34 @@ impl Pager {
                             self.cleanup_after_auto_checkpoint_failure();
                         }
                     }
+                    self.finish_rollback_journal_commit();
                     self.clear_savepoints()?;
                     return Ok(IOResult::Done(()));
                 }
                 _ => {
+                    if let Some(journal) = rollback_journal.as_deref() {
+                        if self.commit_info.read().state == CommitState::PrepareWal {
+                            return_if_io!(self.prepare_rollback_journal_commit(journal));
+                        }
+                    }
                     #[cfg(feature = "autovacuum")]
                     if self.commit_info.read().state == CommitState::PrepareWal {
                         return_if_io!(self.auto_vacuum_commit());
                     }
-                    return_if_io!(self.commit_wal(
-                        connection.wal_auto_actions(),
-                        connection.get_wal_autocheckpoint(),
-                        sync_mode,
-                        connection.get_data_sync_retry(),
-                    ));
+                    // A rollback-journal transaction that changed no page
+                    // leaves the WAL alone: even its header, written without
+                    // EXCLUSIVE, would make SQLite switch to WAL mode.
+                    let nothing_to_write = rollback_journal.is_some()
+                        && self.commit_info.read().state == CommitState::PrepareWal
+                        && self.dirty_pages.read().is_empty();
+                    if !nothing_to_write {
+                        return_if_io!(self.commit_wal(
+                            connection.wal_auto_actions(),
+                            connection.get_wal_autocheckpoint(),
+                            sync_mode,
+                            connection.get_data_sync_retry(),
+                        ));
+                    }
 
                     let schema_did_change = match connection.get_tx_state() {
                         TransactionState::Write { schema_did_change } => schema_did_change,
@@ -3211,6 +3504,7 @@ impl Pager {
 
                     if self.commit_info.read().state != CommitState::AutoCheckpoint {
                         complete_commit();
+                        self.finish_rollback_journal_commit();
                         self.clear_savepoints()?;
                         return Ok(IOResult::Done(()));
                     }
@@ -3237,6 +3531,7 @@ impl Pager {
         }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
+            self.end_rollback_journal_tx();
             return;
         };
         let (is_write, schema_did_change) = match connection.get_tx_state() {
@@ -3256,20 +3551,24 @@ impl Pager {
             self.rollback(schema_did_change, connection, is_write);
         }
         wal.end_read_tx();
+        self.end_rollback_journal_tx();
     }
 
     pub(crate) fn cleanup_read_tx(&self) {
         let Some(wal) = self.wal.as_ref() else {
+            self.end_rollback_journal_tx();
             return;
         };
         self.reset_internal_states();
         if wal.holds_read_lock() {
             wal.end_read_tx();
         }
+        self.end_rollback_journal_tx();
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     pub fn end_read_tx(&self) {
+        self.end_rollback_journal_tx();
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
@@ -3975,6 +4274,19 @@ impl Pager {
                             let page_count = pages.len();
                             tracing::debug!("try_spill_dirty_pages: spilling {} pages", page_count);
                             if let Some(wal) = self.wal.as_ref() {
+                                // In rollback-journal mode pages reach the WAL
+                                // only under EXCLUSIVE, as SQLite spills to
+                                // its database file. While readers are active
+                                // the pages stay in memory.
+                                if let Some(journal) = self.shared.rollback_journal.load_full() {
+                                    if journal
+                                        .lock_exclusive(self.rollback_journal_owner())
+                                        .is_err()
+                                    {
+                                        return Ok(IOResult::Done(()));
+                                    }
+                                    self.set_rollback_journal_level(LockLevel::Exclusive);
+                                }
                                 let page_sz = self.get_page_size().unwrap_or_default();
 
                                 // Ensure WAL is initialized. Most of the time this
@@ -4532,8 +4844,10 @@ impl Pager {
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
 
-                    let need_checkpoint = allowed_auto_actions.contains(WalAutoActions::Checkpoint)
-                        && wal.should_checkpoint(checkpoint_threshold);
+                    // Rollback-journal mode empties the WAL after every commit.
+                    let need_checkpoint = self.shared.rollback_journal.load().is_some()
+                        || (allowed_auto_actions.contains(WalAutoActions::Checkpoint)
+                            && wal.should_checkpoint(checkpoint_threshold));
                     if need_checkpoint {
                         commit_info.state = CommitState::AutoCheckpoint;
                     }
@@ -4863,7 +5177,16 @@ impl Pager {
                     // directly to DB file from the WAL, so the checkpointer connections' page 1 may have stale database_size.
                     if !page1_invalidated {
                         let page1_key = PageCacheKey::new(DatabaseHeader::PAGE_ID);
-                        self.page_cache.write().delete(page1_key)?;
+                        match self.page_cache.write().delete(page1_key) {
+                            Ok(()) => {}
+                            // In rollback-journal mode this checkpoint follows
+                            // the pager's own commit under EXCLUSIVE, so its
+                            // page 1 is the newest one; the committing
+                            // statement may still pin it.
+                            Err(CacheError::Pinned { .. })
+                                if self.shared_rollback_journal_mode() => {}
+                            Err(err) => return Err(LimboError::from(err).into()),
+                        }
                         let mut state = self.checkpoint_state.write();
                         state.phase = CheckpointPhase::TruncateDbFile {
                             sync_mode,
@@ -5249,47 +5572,6 @@ impl Pager {
         // TODO: delete the WAL file here after truncate checkpoint, but *only* if we are sure that
         // no other connections have opened since.
         Ok(())
-    }
-
-    /// Writes the rollback-journal version numbers (1, 1) back into the
-    /// database header once a TRUNCATE checkpoint has emptied the WAL, the
-    /// way SQLite leaves WAL mode for `PRAGMA journal_mode=DELETE`. Returns
-    /// `false` and leaves the file in WAL mode when the WAL still holds
-    /// frames or the pages go through a codec.
-    ///
-    /// The WAL file itself stays until the database is dropped: a later
-    /// connection may still use it, and SQLite reads a WAL file that exists
-    /// whatever the header says, so a crash in between loses nothing.
-    pub fn restore_rollback_journal_header(&self) -> Result<bool> {
-        let Some(wal) = self.wal.as_ref() else {
-            return Ok(false);
-        };
-        if wal.get_max_frame_in_wal() != 0
-            || wal.wal_file()?.size()? != 0
-            || self.io_ctx.read().has_codec_transform()
-        {
-            return Ok(false);
-        }
-        let page = self.io.block(|| self.read_header_page())?;
-        {
-            let contents = page.get_contents();
-            let header = bytemuck::from_bytes_mut::<DatabaseHeader>(
-                &mut contents.as_ptr()[0..DatabaseHeader::SIZE],
-            );
-            let legacy = sqlite3_ondisk::RawVersion::from(sqlite3_ondisk::Version::Legacy);
-            header.write_version = legacy;
-            header.read_version = legacy;
-        }
-        let c = begin_write_btree_page(self, &page, None)?;
-        self.io.wait_for_completion(c)?;
-        let c = sqlite3_ondisk::begin_sync(
-            self.db_file.as_ref(),
-            self.syncing.clone(),
-            self.get_sync_type(),
-        )?;
-        self.io.wait_for_completion(c)?;
-        self.clear_page_cache(false);
-        Ok(true)
     }
 
     /// Perform a blocking checkpoint with the specified mode.

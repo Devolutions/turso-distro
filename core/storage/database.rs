@@ -130,6 +130,12 @@ pub trait DatabaseStorage: Send + Sync {
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion>;
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion>;
+
+    /// The file under this storage, for storages backed by one file. Used
+    /// for SQLite's rollback-journal byte-range locks.
+    fn file(&self) -> Option<Arc<dyn crate::io::File>> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -138,6 +144,10 @@ pub struct DatabaseFile {
 }
 
 impl DatabaseStorage for DatabaseFile {
+    fn file(&self) -> Option<Arc<dyn crate::io::File>> {
+        Some(self.file.clone())
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     fn read_header(&self, c: Completion) -> Result<Completion> {
         self.file.pread(0, c)

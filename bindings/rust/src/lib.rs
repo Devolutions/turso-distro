@@ -178,7 +178,7 @@ pub struct Builder {
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
     enable_mvcc_passive_checkpoint: bool,
-    restore_rollback_journal: bool,
+    rollback_journal: bool,
     vfs: IoBackend,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
     io: Option<Arc<dyn turso_core::IO>>,
@@ -201,7 +201,7 @@ impl Builder {
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
             enable_mvcc_passive_checkpoint: false,
-            restore_rollback_journal: false,
+            rollback_journal: false,
             vfs: IoBackend::Default,
             encryption_opts: None,
             io: None,
@@ -278,12 +278,12 @@ impl Builder {
         self
     }
 
-    /// Turso writes in WAL mode and switches a database that SQLite left in
-    /// rollback-journal mode to WAL when it opens it for writing. With this
-    /// option, the database goes back to rollback-journal mode once its last
-    /// connection has closed, as SQLite's `PRAGMA journal_mode=DELETE` does.
-    pub fn restore_rollback_journal(mut self, enabled: bool) -> Self {
-        self.restore_rollback_journal = enabled;
+    /// Turso switches a database that SQLite left in rollback-journal mode
+    /// to WAL when it opens it for writing. With this option the database
+    /// stays in rollback-journal mode, and Turso takes the same file locks as
+    /// SQLite, so that SQLite processes can use the file at the same time.
+    pub fn rollback_journal(mut self, enabled: bool) -> Self {
+        self.rollback_journal = enabled;
         self
     }
 
@@ -339,8 +339,8 @@ impl Builder {
         if self.enable_mvcc_passive_checkpoint {
             features.push("mvcc_passive_checkpoint");
         }
-        if self.restore_rollback_journal {
-            features.push("restore_rollback_journal");
+        if self.rollback_journal {
+            features.push("rollback_journal");
         }
         if features.is_empty() {
             return None;

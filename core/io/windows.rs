@@ -434,6 +434,75 @@ impl File for WindowsFile {
         Ok(c)
     }
 
+    fn try_lock_range(&self, offset: u64, len: u64, exclusive: bool) -> Result<bool> {
+        let flags = if exclusive {
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY
+        } else {
+            LOCKFILE_FAIL_IMMEDIATELY
+        };
+        let mut overlapped = overlapped_at(offset);
+        let result = unsafe {
+            LockFileEx(
+                self.handle,
+                flags,
+                0,
+                len as u32,
+                (len >> 32) as u32,
+                &mut overlapped,
+            )
+        };
+        if result == TRUE {
+            return Ok(true);
+        }
+        match unsafe { GetLastError() } {
+            windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION => Ok(false),
+            ERROR_IO_PENDING => {
+                // The handle is overlapped: wait for the (immediate) result.
+                let mut transferred = 0;
+                let done = unsafe {
+                    GetOverlappedResult(self.handle, &overlapped, &mut transferred, TRUE)
+                };
+                if done == TRUE {
+                    return Ok(true);
+                }
+                if unsafe { GetLastError() } == windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION
+                {
+                    return Ok(false);
+                }
+                Err(LimboError::LockingError(format!(
+                    "Failed locking file range: {}",
+                    std::io::Error::last_os_error()
+                )))
+            }
+            _ => Err(LimboError::LockingError(format!(
+                "Failed locking file range: {}",
+                std::io::Error::last_os_error()
+            ))),
+        }
+    }
+
+    fn unlock_range(&self, offset: u64, len: u64) -> Result<()> {
+        let mut overlapped = overlapped_at(offset);
+        let result = unsafe {
+            UnlockFileEx(
+                self.handle,
+                0,
+                len as u32,
+                (len >> 32) as u32,
+                &mut overlapped,
+            )
+        };
+        if result == FALSE
+            && unsafe { GetLastError() } != windows_sys::Win32::Foundation::ERROR_NOT_LOCKED
+        {
+            return Err(LimboError::LockingError(format!(
+                "Failed unlocking file range: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
     fn size(&self) -> Result<u64> {
         let mut file_size: i64 = 0;
         let result = unsafe { GetFileSizeEx(self.handle, &mut file_size) };

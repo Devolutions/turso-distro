@@ -402,7 +402,7 @@ impl TursoDatabaseConfig {
                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
                 "without_rowid" => opts.with_without_rowid(true),
                 "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
-                "restore_rollback_journal" => opts.with_restore_rollback_journal(true),
+                "rollback_journal" => opts.with_rollback_journal(true),
                 // "strict" is always enabled, kept for backwards compatibility
                 _ => opts,
             };
@@ -1001,6 +1001,12 @@ impl TursoDatabase {
 
                     let mut open_flags = self.config.open_flags;
                     if opts.enable_multiprocess_wal {
+                        open_flags |= OpenFlags::NoLock;
+                    }
+                    // On Unix the whole-file lock would block SQLite, see
+                    // `DatabaseOpts::with_rollback_journal`.
+                    #[cfg(unix)]
+                    if opts.rollback_journal && !open_flags.contains(OpenFlags::ReadOnly) {
                         open_flags |= OpenFlags::NoLock;
                     }
                     let db_file = if let Some(db_file) = &self.config.db_file {
