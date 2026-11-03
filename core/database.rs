@@ -856,6 +856,20 @@ impl Database {
 
         let init_page_1 = if db_size == 0 {
             let default_page_1 = pager::default_page1(encryption_cipher_mode.as_ref());
+            // A new database in rollback-journal mode starts as SQLite
+            // creates one (see `DatabaseOpts::with_rollback_journal`).
+            if opts.rollback_journal
+                && !opts.enable_multiprocess_wal
+                && encryption_cipher_mode.is_none()
+                && !is_memory_like(&path)
+            {
+                let contents = default_page_1.get_contents();
+                let header = bytemuck::from_bytes_mut::<DatabaseHeader>(
+                    &mut contents.as_ptr()[0..DatabaseHeader::SIZE],
+                );
+                header.write_version = RawVersion::from(Version::Legacy);
+                header.read_version = RawVersion::from(Version::Legacy);
+            }
 
             Some(default_page_1)
         } else {
@@ -2246,7 +2260,8 @@ impl Database {
                         Version::Legacy
                             if self.opts.rollback_journal
                                 && !open_mv_store
-                                && !self.opts.enable_multiprocess_wal =>
+                                && !self.opts.enable_multiprocess_wal
+                                && !is_memory_like(&self.path) =>
                         {
                             self.start_rollback_journal_mode(is_readonly)?;
                             false

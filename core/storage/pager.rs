@@ -3186,6 +3186,54 @@ impl Pager {
         result
     }
 
+    /// Takes RESERVED and EXCLUSIVE before page 1 of a new rollback-journal
+    /// database is written.
+    fn lock_rollback_journal_for_page1(&self, journal: &RollbackJournal) -> Result<()> {
+        if self.rollback_journal_level() == LockLevel::Exclusive {
+            return Ok(());
+        }
+        if self.rollback_journal_level() == LockLevel::None {
+            self.begin_rollback_journal_read(journal)?;
+        }
+        let owner = self.rollback_journal_owner();
+        let result = (|| {
+            if self.rollback_journal_level() < LockLevel::Reserved {
+                journal.lock_reserved(owner)?;
+                self.set_rollback_journal_level(LockLevel::Reserved);
+            }
+            journal.lock_exclusive(owner)?;
+            self.set_rollback_journal_level(LockLevel::Exclusive);
+            // Another process created the database since it was opened.
+            if self.db_file.size()? > 0 {
+                return Err(LimboError::InternalError(
+                    "another process created the database file meanwhile; reopen it".into(),
+                ));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.downgrade_rollback_journal_to_shared();
+        }
+        result
+    }
+
+    /// Gives back RESERVED and EXCLUSIVE, keeping the read transaction's
+    /// SHARED.
+    fn downgrade_rollback_journal_to_shared(&self) {
+        if self.rollback_journal_level() <= LockLevel::Shared {
+            return;
+        }
+        let Some(journal) = self.shared.rollback_journal.load_full() else {
+            return;
+        };
+        let owner = self.rollback_journal_owner();
+        journal.unlock_exclusive(owner);
+        journal.unlock_reserved(owner);
+        self.set_rollback_journal_level(LockLevel::Shared);
+        self.rollback_journal_counter_bumped
+            .store(false, Ordering::Release);
+    }
+
     /// After VACUUM rewrote a rollback-journal database: increments the
     /// change counter, which the new image may carry over unchanged, so that
     /// SQLite drops its cached pages, and releases the locks.
@@ -3319,13 +3367,23 @@ impl Pager {
     /// (sync engine) must not pass `Restart` because rotating the WAL header
     /// behind their back invalidates watermarks they have already published.
     pub fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> IOResultOr<()> {
+        // A new rollback-journal database writes page 1 straight to the file,
+        // so it takes EXCLUSIVE first, as SQLite does to create one.
+        if !self.db_initialized() {
+            if let Some(journal) = self.shared.rollback_journal.load_full() {
+                self.lock_rollback_journal_for_page1(&journal)?;
+            }
+        }
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         return_if_io!(self.maybe_allocate_page1());
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
-        wal.begin_write_tx(allowed_auto_actions)?;
+        if let Err(err) = wal.begin_write_tx(allowed_auto_actions) {
+            self.downgrade_rollback_journal_to_shared();
+            return Err(err.into());
+        }
         if let Some(journal) = self.shared.rollback_journal.load_full() {
             if self.rollback_journal_level() < LockLevel::Reserved {
                 if self.rollback_journal_level() == LockLevel::None {
