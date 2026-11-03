@@ -18,17 +18,27 @@ All workflows are manual and start from the GitHub Actions **Run workflow** butt
 
 | Component | Version |
 | --- | --- |
-| Turso upstream release | `0.9.0-pre.1` / `v0.9.0-pre.1` |
-| Turso downstream source ref | `downstream/v0.9.0-pre.1` based on `upstream/v0.9.0-pre.1` |
+| Turso upstream release | `0.9.0-pre.2` / `v0.9.0-pre.2` |
+| Turso downstream source ref | `downstream/v0.9.0-pre.2` based on `upstream/v0.9.0-pre.2` |
 | Turso .NET target frameworks | `net8.0;net9.0;net10.0` |
-| Downstream package version | `0.9.0-pre.1.0` workflow default |
+| Downstream package version | `0.9.0-pre.2.0` workflow default |
 | Package ID prefix | `Devolutions.Turso.` |
 | Package feed | `https://devolutions.jfrog.io/artifactory/` repository `nuget` |
 
-The `downstream/v0.9.0-pre.1` source branch carries these downstream patches on top of upstream `v0.9.0-pre.1`:
+The `downstream/v0.9.0-pre.2` source branch carries these downstream patches on top of upstream `v0.9.0-pre.2`, grouped so that each group can become one upstream pull request:
 
-- .NET page codec API: `TursoPageCodec` in `Turso.Raw`, `TursoConnection.PageCodec`, and page codec support in the Sqlite facade and EF Core provider.
-- Opt-in binary GUID binding: the `BinaryGUID` connection option stores `Guid` parameters as 16-byte blobs while `DbType.Guid` stays `TEXT`.
+- .NET bindings:
+  - Page codec API: `TursoPageCodec` in `Turso.Raw`, `TursoConnection.PageCodec`, and page codec support in the Sqlite facade and EF Core provider.
+  - Opt-in binary GUID binding: the `BinaryGUID` connection option stores `Guid` parameters as 16-byte blobs while `DbType.Guid` stays `TEXT`.
+  - `CREATE TRIGGER` bodies are kept whole when the local `SqliteCommand` splits statements.
+  - `Experimental Features` connection string keyword, passed to every local open path and part of the pool key.
+  - `Turso.Raw`, `Turso.Data` and `Turso.Data.Sqlite` are AOT and trim safe (source-generated JSON for the remote client).
+  - `GetFieldType` reports the storage class of the value, as Microsoft.Data.Sqlite does.
+- Core fixes:
+  - `sqlite_schema` keeps identifier case as written, as SQLite does.
+  - The schema-loading connection is released when a database finishes opening, so closing the last connection checkpoints the WAL.
+- Auto-vacuum (`PRAGMA auto_vacuum=FULL|INCREMENTAL`) compatible with SQLite: exact pointer maps, truncation at commit, root page placement and relocation on `DROP`, `PRAGMA incremental_vacuum`, mode changes through `PRAGMA auto_vacuum` and `VACUUM`, pointer-map checks in `PRAGMA integrity_check`, and `turso::Builder::experimental_autovacuum`.
+- Rollback-journal databases: the `rollback_journal` option keeps a database that SQLite left in rollback-journal mode in that mode, with SQLite's file locks, so SQLite processes can share it.
 
 ## Packages
 
@@ -45,7 +55,7 @@ The `downstream/v0.9.0-pre.1` source branch carries these downstream patches on 
 Only package identity changes. Assembly names (`Turso.Data.dll`, `Turso.Raw.dll`, ...), namespaces, and the native library name (`turso_sdk_kit`) are unchanged, so switching from the upstream packages only requires changing the `PackageReference`:
 
 ```xml
-<PackageReference Include="Devolutions.Turso.Data.Sqlite.Provider" Version="0.9.0-pre.1.0" />
+<PackageReference Include="Devolutions.Turso.Data.Sqlite.Provider" Version="0.9.0-pre.2.0" />
 ```
 
 With NuGet package source mapping, map `Devolutions.Turso.*` to the Artifactory feed.
@@ -60,7 +70,7 @@ With NuGet package source mapping, map `Devolutions.Turso.*` to the Artifactory 
 
 ## Publishing releases
 
-The release version is `TURSO_VERSION.PACKAGE_REVISION`, such as `0.9.0-pre.1.0`. Manual inputs:
+The release version is `TURSO_VERSION.PACKAGE_REVISION`, such as `0.9.0-pre.2.0`. Manual inputs:
 
 | Input | Purpose |
 | --- | --- |
@@ -80,7 +90,7 @@ The upstream sync workflow needs a `TURSO_UPSTREAM_SYNC_TOKEN` or `DEVOLUTIONSBO
 `eng/Vendor-TursoPackages.ps1` works on any folder of upstream Turso packages, for example the output of `make pack`:
 
 ```powershell
-.\eng\Vendor-TursoPackages.ps1 -InputDirectory .\output\upstream-packages -OutputDirectory .\output\nuget -PackageVersion 0.9.0-pre.1.0 -UpstreamVersion 0.9.0-pre.1
+.\eng\Vendor-TursoPackages.ps1 -InputDirectory .\output\upstream-packages -OutputDirectory .\output\nuget -PackageVersion 0.9.0-pre.2.0 -UpstreamVersion 0.9.0-pre.2
 ```
 
 ## Updating Turso versions

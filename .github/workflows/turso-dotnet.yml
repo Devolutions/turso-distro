@@ -90,11 +90,11 @@ permissions:
   contents: read
 
 env:
-  TURSO_VERSION: "0.9.0-pre.1"
-  TURSO_RELEASE_TAG: "v0.9.0-pre.1"
-  TURSO_UPSTREAM_TAG: "upstream/v0.9.0-pre.1"
+  TURSO_VERSION: "0.9.0-pre.2"
+  TURSO_RELEASE_TAG: "v0.9.0-pre.2"
+  TURSO_UPSTREAM_TAG: "upstream/v0.9.0-pre.2"
   TURSO_SOURCE_REPOSITORY: ${{ github.repository }}
-  TURSO_SOURCE_REF: "downstream/v0.9.0-pre.1"
+  TURSO_SOURCE_REF: "downstream/v0.9.0-pre.2"
   TURSO_DOTNET_DIR: "turso-src/bindings/dotnet"
   PACKAGE_VENDOR_NAME: "Devolutions"
   PACKAGE_ID_PREFIX: "Devolutions.Turso."
