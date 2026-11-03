@@ -1458,7 +1458,12 @@ pub fn translate_create_table(
     // `sequence_backing_table_name` then maps it to the physical
     // `__turso_internal_seq_<sequence-name>` table.
     // Skip if it already exists (e.g. VACUUM INTO copies all tables first).
-    if has_autoincrement {
+    // Only MVCC reads that sequence; a database kept in rollback-journal mode
+    // for SQLite cannot switch to MVCC and keeps its counters in
+    // `sqlite_sequence` alone, as SQLite does.
+    let rollback_journal_mode =
+        database_id == crate::MAIN_DB_ID && connection.db.in_rollback_journal_mode();
+    if has_autoincrement && !rollback_journal_mode {
         let autoinc_seq_name = crate::schema::autoincrement_sequence_name(&normalized_tbl_name);
         let backing_table_name =
             crate::translate::sequence::sequence_backing_table_name(&autoinc_seq_name);
