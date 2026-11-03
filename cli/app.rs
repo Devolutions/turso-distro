@@ -373,7 +373,16 @@ impl Limbo {
     fn handle_first_input(&mut self) -> Result<(), LimboError> {
         self.consume(true);
         self.close_conn()?;
-        std::process::exit(i32::from(self.had_query_error));
+        self.exit(i32::from(self.had_query_error));
+    }
+
+    /// Exits the process after dropping the database, which
+    /// `std::process::exit` would skip: a database in rollback-journal mode
+    /// deletes its empty WAL file when it is dropped.
+    fn exit(&mut self, code: i32) -> ! {
+        let _ = self.conn.close();
+        let _ = self.open_db(":memory:", None);
+        std::process::exit(code);
     }
 
     fn set_multiline_prompt(&mut self) {
@@ -818,13 +827,13 @@ impl Limbo {
                 Command::Exit(args) => {
                     let _ = self.close_conn();
                     self.save_history();
-                    std::process::exit(args.code);
+                    self.exit(args.code);
                 }
                 Command::Quit => {
                     let _ = self.writeln("Exiting Turso SQL Shell.");
                     let _ = self.close_conn();
                     self.save_history();
-                    std::process::exit(0)
+                    self.exit(0)
                 }
                 Command::Open(args) => {
                     if let Err(e) = self.open_db(&args.path, args.vfs_name.as_deref()) {
