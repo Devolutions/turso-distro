@@ -362,6 +362,7 @@ pub fn translate_create_view(
     if_not_exists: bool,
     connection: &Arc<crate::Connection>,
     program: &mut ProgramBuilder,
+    source_text: Option<&str>,
 ) -> Result<()> {
     // TEMP views always live in the temp schema. The parser rejects
     // CREATE TEMP VIEW with a database name other than "temp".
@@ -434,6 +435,11 @@ pub fn translate_create_view(
         columns,
         &select_stmt,
     );
+    // The statement as written, as SQLite keeps it, when asked for.
+    let sql = match source_text {
+        Some(input) => crate::schema_text::create_sql(input, sql),
+        None => sql,
+    };
 
     // Open cursor to sqlite_schema table
     let table = resolver

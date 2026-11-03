@@ -739,6 +739,77 @@ fn test_rollback_journal_option_on_in_memory_database() {
     assert_eq!(turso_texts(&conn, "PRAGMA journal_mode"), rows(&["wal"]));
 }
 
+/// DDL run through both engines by `test_rollback_journal_schema_text_matches_sqlite`:
+/// odd spacing and case, comments, IF NOT EXISTS, schema-qualified names,
+/// triggers with comments, a view, AUTOINCREMENT and every ALTER TABLE form.
+const SCHEMA_SCRIPT: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS Connections (\n    ID BLOB NOT NULL PRIMARY KEY, -- the key\n    Name TEXT   COLLATE NOCASE,\n    \"Data\" TEXT,\n    [Key] TEXT\n);",
+    "CREATE TABLE ConnectionHistory (ID INTEGER PRIMARY KEY AUTOINCREMENT, ConnectionID BLOB, Version int default 0)",
+    "create table main.Handbook(ID INTEGER PRIMARY KEY AUTOINCREMENT, Title TEXT);",
+    "CREATE INDEX IF NOT EXISTS IX_ConnectionHistory on ConnectionHistory (ConnectionID asc);",
+    "CREATE UNIQUE INDEX main.IX_Name ON Connections(Name) WHERE Name IS NOT NULL ;",
+    "CREATE TABLE t2(a, b, CONSTRAINT pk PRIMARY KEY (a));",
+    "CREATE VIEW v1 AS\n   SELECT Name FROM Connections   ;",
+    "CREATE TRIGGER IF NOT EXISTS Connections_Trigger_Delete DELETE ON Connections\nBEGIN\n    -- v1\n\n    -- comment\n    UPDATE ConnectionHistory SET Version = Version + 1 WHERE ConnectionID = old.ID;\nEND;",
+    "ALTER TABLE Connections ADD COLUMN Extra TEXT DEFAULT 'x' ;",
+    "ALTER TABLE t2 ADD c INTEGER",
+    "ALTER TABLE ConnectionHistory RENAME COLUMN Version TO Revision",
+    "ALTER TABLE Connections RENAME COLUMN Name TO \"Display Name\"",
+    "ALTER TABLE t2 RENAME TO t3",
+    "ALTER TABLE t3 DROP COLUMN c",
+];
+
+fn schema_rows(conn: &rusqlite::Connection) -> Vec<(String, String, String, Option<String>)> {
+    conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// sqlite_master.sql holds the statement text as written, from the object
+/// name on, and ALTER TABLE edits it in place, as in SQLite.
+#[test]
+fn test_rollback_journal_schema_text_matches_sqlite() {
+    let dir = TempDir::new().unwrap();
+    let sqlite_path = dir.path().join("sqlite.db");
+    let turso_path = dir.path().join("turso.db");
+    let sqlite = rusqlite::Connection::open(&sqlite_path).unwrap();
+    let db = Database::open_file_with_flags(
+        Arc::new(turso_core::PlatformIO::new().unwrap()),
+        turso_path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new()
+            .with_rollback_journal(true)
+            .with_views(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    for statement in SCHEMA_SCRIPT {
+        sqlite.execute_batch(statement).unwrap();
+        conn.execute(statement)
+            .unwrap_or_else(|err| panic!("{statement}: {err}"));
+    }
+    drop(conn);
+    drop(db);
+    let turso = rusqlite::Connection::open(&turso_path).unwrap();
+    let expected = schema_rows(&sqlite);
+    let actual = schema_rows(&turso);
+    for (expected, actual) in expected.iter().zip(&actual) {
+        assert_eq!(actual, expected);
+    }
+    assert_eq!(actual.len(), expected.len(), "{actual:#?}");
+    assert_eq!(
+        sqlite_texts(&turso, "PRAGMA integrity_check"),
+        rows(&["ok"])
+    );
+}
+
 /// AUTOINCREMENT keeps its counters in sqlite_sequence, as in SQLite, and
 /// both engines continue each other's counters.
 #[test]

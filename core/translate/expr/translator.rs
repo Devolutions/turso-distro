@@ -1266,6 +1266,25 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
+                ScalarFunc::AlterTableSql => {
+                    if args.len() != 4 {
+                        crate::bail_parse_error!(
+                            "wrong number of arguments to function {}()",
+                            srf.to_string()
+                        );
+                    }
+                    let start_reg = program.alloc_registers(args.len());
+                    for (i, arg) in args.iter().enumerate() {
+                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
+                    }
+                    program.emit_insn(Insn::Function {
+                        constant_mask: 0,
+                        start_reg,
+                        dest: target_register,
+                        func: func_ctx,
+                    });
+                    Ok(target_register)
+                }
                 ScalarFunc::Concat => {
                     if args.is_empty() {
                         crate::bail_parse_error!(

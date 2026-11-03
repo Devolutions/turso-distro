@@ -99,6 +99,7 @@ pub fn translate_create_index(
     connection: &Arc<crate::Connection>,
     resolver: &Resolver,
     stmt: ast::Stmt,
+    source_text: Option<&str>,
 ) -> crate::Result<()> {
     let written_stmt = stmt.clone();
     let ast::Stmt::CreateIndex {
@@ -139,6 +140,11 @@ pub fn translate_create_index(
         resolver.name_in_sql(namespace, &original_idx_name.name),
         resolver.name_in_sql(namespace, &original_tbl_name),
     );
+    // The statement as written, as SQLite keeps it, when asked for.
+    let sql = match source_text {
+        Some(input) => crate::schema_text::create_sql(input, sql),
+        None => sql,
+    };
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(original_tbl_name.as_str());
 

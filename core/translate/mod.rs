@@ -242,6 +242,10 @@ pub fn translate_inner(
         None
     };
 
+    // A database kept in rollback-journal mode for SQLite stores the text of
+    // CREATE statements as written, as SQLite does (see `schema_text`).
+    let source_text = connection.db.in_rollback_journal_mode().then_some(input);
+
     match stmt {
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?;
@@ -262,7 +266,7 @@ pub fn translate_inner(
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?;
+            translate_create_index(program, connection, resolver, stmt, source_text)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -302,6 +306,7 @@ pub fn translate_inner(
             program,
             &commands,
             when_clause.as_deref(),
+            source_text,
         )?,
         ast::Stmt::CreateView {
             view_name,
@@ -318,6 +323,7 @@ pub fn translate_inner(
             if_not_exists,
             connection,
             program,
+            source_text,
         )?,
         ast::Stmt::CreateMaterializedView {
             view_name,

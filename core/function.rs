@@ -943,6 +943,10 @@ pub enum ScalarFunc {
     ConnTxnId,
     IsAutocommit,
     SequenceWatermark,
+    /// `turso_alter_table_sql(op, sql, rendered, arg)`: the `sqlite_schema`
+    /// text after `ALTER TABLE ... ADD|DROP COLUMN`, edited in place as
+    /// SQLite does (see `schema_text`).
+    AlterTableSql,
     // Test type functions (for custom type system testing)
     TestUintEncode,
     TestUintDecode,
@@ -1082,6 +1086,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::ConnTxnId => false, // depends on connection state
             ScalarFunc::IsAutocommit => false, // depends on connection state
             ScalarFunc::SequenceWatermark => false, // depends on active MVCC transactions
+            ScalarFunc::AlterTableSql => true,
             ScalarFunc::TestUintEncode
             | ScalarFunc::TestUintDecode
             | ScalarFunc::TestUintAdd
@@ -1245,6 +1250,7 @@ impl Display for ScalarFunc {
             Self::ConnTxnId => "conn_txn_id",
             Self::IsAutocommit => "is_autocommit",
             Self::SequenceWatermark => "sequence_watermark_experimental",
+            Self::AlterTableSql => "turso_alter_table_sql",
             Self::TestUintEncode => "test_uint_encode",
             Self::TestUintDecode => "test_uint_decode",
             Self::TestUintAdd => "test_uint_add",
@@ -1368,6 +1374,7 @@ impl ScalarFunc {
             | Self::TimeDiff => &[2],
             // 3-arg
             Self::Iif | Self::Replace | Self::SetByte => &[3],
+            Self::AlterTableSql => &[4],
             // Multi-arity (one row per valid arity)
             Self::Like => &[2, 3],
             Self::Trim | Self::LTrim | Self::RTrim | Self::Round | Self::Unhex => &[1, 2],

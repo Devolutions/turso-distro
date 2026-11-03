@@ -102,6 +102,7 @@ pub fn translate_create_trigger(
     program: &mut ProgramBuilder,
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
+    source_text: Option<&str>,
 ) -> Result<()> {
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
     if is_reserved_object_name(
@@ -152,6 +153,11 @@ pub fn translate_create_trigger(
         when_clause,
         commands,
     );
+    // The statement as written, as SQLite keeps it, when asked for.
+    let sql = match source_text {
+        Some(input) => crate::schema_text::create_sql(input, sql),
+        None => sql,
+    };
     // Like SQLite, the row keeps the trigger name as written, and records the
     // target table as the trigger names it.
     let mangled_trigger_name = resolver.mangle_name(namespace, trigger_name.name.as_str());
